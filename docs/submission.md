@@ -34,7 +34,8 @@ dashboard shows the empirical error against the guaranteed bound as you drag the
 
 **Links**
 - Repo: https://github.com/feedofmri/keel
-- Live site and dashboard: https://feedofmri.github.io/keel/
+- Demo Video: https://www.youtube.com/watch?v=I77PAVkJDCI
+- Live site and dashboard: https://keel.boraqs.com/
 - Live demo repo: https://github.com/feedofmri/keel-demo
 - What was built during the hackathon: https://github.com/feedofmri/keel/blob/main/HACKATHON.md
 

@@ -6,6 +6,7 @@
 <p align="center"><b>A code-repair agent that knows when it should not be trusted.</b></p>
 <p align="center">
   <a href="https://keel.boraqs.com">keel.boraqs.com</a> ·
+  <a href="https://www.youtube.com/watch?v=I77PAVkJDCI"><b>Demo Video</b></a> ·
   <a href="https://feedofmri.github.io/keel/">Preview (GitHub Pages)</a> ·
   <a href="https://feedofmri.github.io/keel/results">Results</a> ·
   <a href="#install-as-a-github-action">Install</a> ·
@@ -30,6 +31,15 @@ Keel uses **Meta's Muse models** to generate candidate patches for failing tests
 
 > Built for the Meta Global AI Developer Hackathon 2026 (*Push the Frontier*, software). All code in
 > this repository was written during the event. See [`HACKATHON.md`](HACKATHON.md).
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=I77PAVkJDCI">
+    <img src="https://img.youtube.com/vi/I77PAVkJDCI/maxresdefault.jpg" width="700" alt="Watch the Keel Demo Video">
+  </a>
+  <br>
+  <b><a href="https://www.youtube.com/watch?v=I77PAVkJDCI">▶️ Watch the 3-Minute Demo Video & Live Walkthrough</a></b>
+</p>
+
 
 ## How Meta's models are used
 

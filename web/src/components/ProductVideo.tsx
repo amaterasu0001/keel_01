@@ -3,7 +3,7 @@ import { asset } from "../lib/env";
 
 // The product overview video, hosted on YouTube. The player loads only when the visitor presses play
 // (no YouTube requests or cookies before then), using the privacy-enhanced youtube-nocookie.com domain.
-export const VIDEO_ID = "1RSKHhfeah4";
+export const VIDEO_ID = "I77PAVkJDCI";
 export const VIDEO_URL = `https://youtu.be/${VIDEO_ID}`;
 
 export function ProductVideo() {

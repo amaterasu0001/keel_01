@@ -1,25 +1,17 @@
-# Demo video (3:00)
-
-Motion-graphics segments are rendered from [`docs/video/scenes.html`](video/scenes.html) to
-`docs/video/out/*.mp4` (`python3 -m http.server 8766` from the repo root, then `node docs/video/render.js`).
-**Re-render after the real benchmark run** so the guarantee scene shows real numbers.
-Everything else is a screen recording of the real product.
-
-| Time | Visual | Voice-over |
-|------|--------|-----------|
-| 0:00–0:08 | `hook.mp4`: PRs pile up | "Coding agents now write patches faster than anyone can review them. So which ones can you merge without looking?" |
-| 0:08–0:20 | `pipeline.mp4` (first half) | "Keel is a code-repair agent that knows when it shouldn't be trusted. Meta's Muse Spark and Muse Spark Open generate candidate fixes…" |
-| 0:20–0:32 | `pipeline.mp4` (second half) | "…then Muse Spark writes adversarial tests to attack them, and Keel scores every patch and decides, with a statistical guarantee." |
-| 0:32–1:05 | **Screen:** `keel-demo` repo. Apply `bugs/01-discount-backwards.patch`, push, CI goes red, Keel workflow starts (speed up 4×) | "Here's a real repo. I push a bug. CI fails, and Keel kicks in on a free GitHub runner." |
-| 1:05–1:30 | **Screen:** the Keel PR with the green **AUTO-MERGE** label; scroll the explanation and candidate table | "One minute later: a pull request, labelled AUTO-MERGE. Both Meta models agreed, it survived every adversarial test, and its risk score is under the calibrated threshold." |
-| 1:30–1:55 | **Screen:** apply `bugs/02-shipping-rules.patch` → the **NEEDS REVIEW** PR. Highlight "passes every visible test" and "fails adversarial tests" | "Now a nastier bug. This patch passes every visible test, so most agents would ship it. Keel says NEEDS REVIEW and tells the reviewer exactly why." |
-| 1:55–2:25 | **Screen:** dashboard. Drag α from 5% to 30%; switch CRC/LTT; hover the chart | "This is the guarantee. Pick a risk level. On held-out SWE-bench and QuixBugs bugs, Keel's real error stays under the bound, while 'merge if tests pass' and model self-confidence blow straight through it." |
-| 2:25–2:40 | `guarantee.mp4` or the dashboard's model and ablation tables | "Muse Spark Open's token probabilities, signals only open weights expose, raise how much Keel can safely merge, at a fraction of the cost." |
-| 2:40–3:00 | `end.mp4` | "Everything you saw was built this week. Keel: Meta models propose, conformal risk control decides." |
-
-## Recording checklist
-- [ ] Benchmarks finished; dashboard shows real data (no preview banner)
-- [ ] `keel-demo` has the secrets, the calibration file and Actions write permission
-- [ ] Do a dry run of both bugs before recording (model outputs vary; keep the best take)
-- [ ] 1080p, browser zoom 125%, dark theme, notifications off
-- [ ] Under 3:00; captions burned in; upload as unlisted YouTube/Vimeo, check it plays logged out
+# Demo Video Walkthrough
+
+**YouTube Link:** [https://www.youtube.com/watch?v=I77PAVkJDCI](https://www.youtube.com/watch?v=I77PAVkJDCI)
+
+*Core Hackathon 3-Minute Evaluation:* **0:00 – 3:00**
+
+## Video Structure & Walkthrough
+
+| Time | Screen / Context | Voice-over & Technical Focus |
+|------|------------------|------------------------------|
+| 0:00–0:35 | **Live Platform:** [keel.boraqs.com](https://keel.boraqs.com) | The AI code review bottleneck: 30–60% of agent PRs fail or regress. Introducing Keel: autonomous code repair with a distribution-free error bound. |
+| 0:35–1:05 | **GitHub Repo:** [feedofmri/keel](https://github.com/feedofmri/keel) | Multi-model architecture: Muse Spark (Meta Model API) and Muse Spark Open (Baseten) propose fixes. Muse Spark writes adversarial tests. Token logprobs provide open-weights uncertainty. |
+| 1:05–1:40 | **Live GitHub PR #1:** keel-demo | Clean bug fix: CI fails, Keel triggers on GitHub runner, opens PR with green **AUTO-MERGE** label. Nonconformity score  \le \hat{\lambda}$. |
+| 1:40–2:10 | **Live GitHub PR #2:** keel-demo | Deceptive bug: passes visible tests, but fails Muse Spark adversarial attack. High uncertainty flags PR with yellow **NEEDS REVIEW** label and explanation. |
+| 2:10–2:40 | **Interactive Dashboard:** /results | Real-time **Risk Slider ($\\alpha$)**: dragging $\\alpha$ from 5% to 20% updates thresholds dynamically. Empirical error on SWE-bench Lite and QuixBugs remains strictly below the bound. |
+| 2:40–3:00 | **Provenance & Meta Lineage** | Built 100% during the hackathon (Oct 26 – Nov 4). Assured LLM software engineering with Meta Muse models. |
+| 3:00–5:00 | **Extended Deep Dive** | Deep dive into feature extraction (20 signals), token logprob uncertainty, Fastify/PostgreSQL architecture, and calibration artifacts. |
