@@ -165,19 +165,80 @@ def cmd_submission(a: argparse.Namespace) -> int:
         from ..generators import build_generator
         judge = build_generator(a.judge, cache_dir=a.cache)
     out_dir = Path(a.out_dir)
+    if a.preds and len(a.folders) != 1:
+        raise SystemExit("--preds works with exactly one submission folder")
     for folder in a.folders:
-        recs = load_submission(folder, insts, judge=judge, with_traj=not a.no_traj, log=_log)
+        recs = load_submission(folder, insts, judge=judge, with_traj=not a.no_traj, log=_log, preds_path=a.preds)
         out = out_dir / f"{Path(folder).name}.jsonl"
         rec_io.save(out, recs)
         _log(f"wrote {out}")
     return 0
 
 
+def cmd_instances(a: argparse.Namespace) -> int:
+    from . import swebench as sb
+    from .fetch import save_instances
+    n = save_instances(sb.load_instances(None, dataset=sb.DATASETS[a.dataset]), a.out)
+    _log(f"wrote {n} SWE-bench {a.dataset} instances to {a.out}")
+    return 0
+
+
+def cmd_fetch(a: argparse.Namespace) -> int:
+    """Oracle 1 input: download published submissions (patches, harness reports, results.json)."""
+    from .fetch import fetch_submission
+    ids = None
+    if a.instances:
+        from .experiments_repo import load_instances_file
+        ids = sorted(load_instances_file(a.instances))
+        if a.limit:
+            ids = ids[:a.limit]
+        ids = set(ids)
+    elif a.limit:
+        raise SystemExit("--limit needs --instances (the local SWE-bench rows file from `keel eval instances`)")
+    bad = 0
+    for name in a.submissions:
+        s = fetch_submission(name, a.out, a.split, trajs=a.trajs, instances=ids, workers=a.workers, log=_log)
+        bad += s["readme_resolved"] is not None and s["readme_resolved"] != s["resolved"]
+    _log(f"done. Next: keel eval submission {a.out}/<submission> --instances <rows> --out-dir results/agents")
+    return 1 if bad else 0
+
+
+def cmd_abs_run(a: argparse.Namespace) -> int:
+    """Oracle 2: build (and run) the SWE-ABS harness call for downloaded submissions."""
+    from . import abs_labels as ab
+    models = a.models.split(",")
+    layout = ab.check_layout(a.models_root, models)
+    for m, n in layout.items():
+        _log(f"{m}: {n} instances with report.json + patch.diff")
+    if not all(layout.values()):
+        raise SystemExit("some models have no logs/<instance>/{report.json,patch.diff}; run `keel eval fetch` first")
+    ids = a.instance_ids.split(",") if a.instance_ids else None
+    if a.pilot:
+        ids = ab.ready_instances(Path(a.models_root) / models[0])[:a.pilot]
+        _log(f"pilot: {len(ids)} downloaded instances resolved by {models[0]}")
+    cmd = ab.abs_command(a.models_root, models, a.run_id, ids, a.workers, a.timeout, a.python, rerun=a.rerun)
+    print(" ".join(cmd))
+    if a.dry_run or not a.sweabs_dir:
+        _log("not run (pass --sweabs-dir to run it; use it from <SWE-ABS>/swe-bench in the swe-abs environment)")
+        return 0
+    rc = ab.run_sweabs(a.sweabs_dir, cmd, log=_log)
+    out = ab.final_results_path(a.sweabs_dir, a.run_id)
+    _log(f"harness exit code {rc}; results: {out}" + ("" if out.exists() else " (missing!)"))
+    return rc
+
+
 def cmd_abs_labels(a: argparse.Namespace) -> int:
     from . import abs_labels as ab
     recs = rec_io.load(a.records)
+    if a.sweabs_dir and not a.final_results:
+        if not a.run_id:
+            raise SystemExit("--sweabs-dir needs --run-id")
+        a.final_results = str(ab.final_results_path(a.sweabs_dir, a.run_id))
     if a.final_results:
         labels = ab.read_final_results(a.final_results)
+        for model, prob in ab.final_results_problems(a.final_results).items():
+            if prob["error"]:
+                _log(f"{model}: SWE-ABS reported errors on {len(prob['error'])} instances (no ABS label for them)")
     else:
         labels = ab.read_harness_reports(a.workdir, a.run_id)
     key_map = json.loads(Path(a.key_map).read_text()) if a.key_map else None
@@ -191,8 +252,28 @@ def cmd_audit_export(a: argparse.Namespace) -> int:
     from .audit import export
     recs = _load_all(a.records)
     st = export(recs, _instances(a), a.out, a.audit_frac, tuple(a.oracles.split(",")), a.double_frac, a.seed)
-    _log(f"audit: {st['items']} items ({st['double_rated']} for a second rater) in {a.out}. Give raters "
-         f"items/ and sheet.csv only; key.csv links items back to agents and must stay hidden from them.")
+    _log(f"audit: {st['items']} items ({st['double_rated']} for a second rater) in {a.out}. Give rater 1 "
+         f"items/ + rater1.csv and rater 2 items/ + rater2.csv, separately; keep key.csv away from both.")
+    return 0
+
+
+def cmd_audit_status(a: argparse.Namespace) -> int:
+    from .audit import audit_status
+    st = audit_status(a.audit)
+    _log(f"audit status: {st}")
+    if st["disagreements"] and st["adjudicated"] < st["disagreements"]:
+        _log(f"{st['disagreements'] - st['adjudicated']} disagreements need a `final` verdict in "
+             f"{Path(a.audit) / 'adjudication.csv'}")
+    if st["kappa"] is not None and st["kappa"] < 0.6:
+        _log("Cohen's kappa is below 0.6: refine the labelling guide and re-rate")
+    return 0
+
+
+def cmd_labels_status(a: argparse.Namespace) -> int:
+    from .thesis import readiness
+    for p in a.records:
+        st = readiness(rec_io.load(p), a.audit_frac)
+        _log(f"{p}: {st}")
     return 0
 
 
@@ -308,10 +389,41 @@ def add_eval_commands(sub) -> None:
     sm.add_argument("--judge", help="model for the LLM-judge signal (optional, costs API calls)")
     sm.add_argument("--cache", default=".keel-cache")
     sm.add_argument("--no-traj", action="store_true")
+    sm.add_argument("--preds", help="predictions file if it is not in the folder (all_preds.jsonl or preds.json)")
     sm.set_defaults(fn=cmd_submission)
+
+    ins = es.add_parser("instances", help="save SWE-bench rows locally (needed by fetch --limit, submission, audit)")
+    ins.add_argument("--dataset", choices=["lite", "verified"], default="verified")
+    ins.add_argument("--out", default="results/verified.jsonl")
+    ins.set_defaults(fn=cmd_instances)
+
+    fe = es.add_parser("fetch", help="Oracle 1: download published submissions (patches, reports, results.json)")
+    fe.add_argument("submissions", nargs="+", help="submission names, e.g. 20250807_openhands_gpt5")
+    fe.add_argument("--split", default="verified")
+    fe.add_argument("--out", default="data/submissions", help="also the SWE-ABS --vaild_model_path")
+    fe.add_argument("--instances", help="only instances in this rows file")
+    fe.add_argument("--limit", type=int, help="only the first N instances (pilot; needs --instances)")
+    fe.add_argument("--trajs", action="store_true", help="also download trajectories (for trajectory signals)")
+    fe.add_argument("--workers", type=int, default=8)
+    fe.set_defaults(fn=cmd_fetch)
+
+    ar = es.add_parser("abs-run", help="Oracle 2: build / run the SWE-ABS harness on downloaded submissions")
+    ar.add_argument("--models-root", default="data/submissions", help="the `keel eval fetch` output folder")
+    ar.add_argument("--models", required=True, help="comma-separated submission names")
+    ar.add_argument("--run-id", required=True)
+    ar.add_argument("--sweabs-dir", help="SWE-ABS checkout; without it the command is only printed")
+    ar.add_argument("--pilot", type=int, help="only the first N instances the first model resolved")
+    ar.add_argument("--instance-ids", help="comma-separated instance ids")
+    ar.add_argument("--workers", type=int, default=8)
+    ar.add_argument("--timeout", type=int, default=1800, help="per-instance timeout in seconds (SWE-ABS default)")
+    ar.add_argument("--python", default="python", help="python of the swe-abs environment")
+    ar.add_argument("--rerun", action="store_true", help="ignore an existing final_results.json for this run id")
+    ar.add_argument("--dry-run", action="store_true")
+    ar.set_defaults(fn=cmd_abs_run)
 
     ab = es.add_parser("abs-labels", help="merge strengthened-test (SWE-ABS) labels into records")
     ab.add_argument("records")
+    ab.add_argument("--sweabs-dir", help="find final_results.json for --run-id in this SWE-ABS checkout")
     ab.add_argument("--final-results", help="SWE-ABS swe_abs_res/eval_agent/<run>/final_results.json")
     ab.add_argument("--workdir", help="official-harness workdir (cross-check route)")
     ab.add_argument("--run-id")
@@ -337,6 +449,15 @@ def add_eval_commands(sub) -> None:
     ai.add_argument("--out", help="default: overwrite the records file")
     ai.add_argument("--unsure-as-missing", action="store_true", help="default treats 'unsure' as wrong")
     ai.set_defaults(fn=cmd_audit_import)
+
+    ast_ = es.add_parser("audit-status", help="audit progress and kappa; writes adjudication.csv for disagreements")
+    ast_.add_argument("--audit", default="results/audit")
+    ast_.set_defaults(fn=cmd_audit_status)
+
+    ls = es.add_parser("labels-status", help="labels per oracle and which thesis variants can run")
+    ls.add_argument("records", nargs="+")
+    ls.add_argument("--audit-frac", type=float, default=0.25)
+    ls.set_defaults(fn=cmd_labels_status)
 
     th = es.add_parser("thesis", help="RQ1 inflation, RQ3 correction, RQ4 audit budget -> tables and charts")
     th.add_argument("records", nargs="+")

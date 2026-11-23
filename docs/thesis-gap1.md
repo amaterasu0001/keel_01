@@ -8,10 +8,11 @@ three labels per patch, runs the experiments for RQ1, RQ3 and RQ4, and writes ev
 | Fixed-sequence Learn-then-Test, false-merge target, three tiers | `keel/conformal.py` |
 | Noise-corrected LTT (variants A and B) | `keel/conformal_noisy.py` |
 | Labels per oracle (`orig`, `abs`, `human`, `true`, `best`) | `keel/eval/records.py` |
+| Download submissions and SWE-bench rows (Oracle 1 input, SWE-ABS layout) | `keel/eval/fetch.py` |
 | Records from leaderboard submissions | `keel/eval/experiments_repo.py` |
 | Signals for external agents (diff, issue, trajectory, LLM judge) | `keel/eval/signals_ext.py` |
-| Strengthened-test labels (SWE-ABS) | `keel/eval/abs_labels.py` |
-| Human audit: export, import, Cohen's kappa | `keel/eval/audit.py` |
+| Strengthened-test labels: run SWE-ABS, read its output (Oracle 2) | `keel/eval/abs_labels.py` |
+| Human audit: two blind sheets, status, adjudication, import, kappa (Oracle 3) | `keel/eval/audit.py` |
 | Experiments: inflation, correction, audit budget | `keel/eval/thesis.py` |
 | Tables and SVG charts | `keel/eval/figures.py` |
 | Simulation with oracle noise (known ground truth) | `keel/eval/simulate.py` |
@@ -37,53 +38,72 @@ keel eval thesis results/sim/noisy.jsonl --out-dir results/thesis-sim
 `results/thesis-sim/README.md` then shows RQ1 (plain LTT breaks against the true labels), RQ3 (variants
 A and B stay within δ) and RQ4 (merge rate against audit budget). Simulated records are always marked.
 
-## Step 1: published agent patches and original labels (no Docker)
+## Step 1 · Oracle 1: published agent patches and original labels (no Docker)
 
 ```bash
-git clone --depth 1 https://github.com/swe-bench/experiments
-keel eval submission experiments/evaluation/verified/<submission> [more folders ...] \
-    --dataset verified --out-dir results/agents            # --limit 100 for the pilot
+keel eval instances --out results/verified.jsonl                    # the 500 SWE-bench Verified rows, once
+keel eval fetch 20250807_openhands_gpt5 20241202_agentless-1.5_claude-3.5-sonnet-20241022 \
+    --instances results/verified.jsonl --out data/submissions       # --limit 100 for a pilot, --trajs for trajectories
+keel eval submission data/submissions/20250807_openhands_gpt5 data/submissions/<other> \
+    --instances results/verified.jsonl --out-dir results/agents
 ```
 
-One records file per submission. `orig` = not resolved according to the submission's
-`results/results.json` (or its per-instance `logs/*/report.json`). Check first that the folders you
-pick have these files; some trajectories are only in a separate download. Add `--judge muse-spark`
-(or any configured model) for the LLM-judge signal; it costs one call per patch.
+`fetch` downloads, per submission, `results/results.json`, `README.md`, `metadata.yaml` from
+swe-bench/experiments and `logs/<instance>/{patch.diff,report.json}` (plus `trajs/` with `--trajs`)
+from the public S3 bucket, or from the submitter's own repository when `metadata.yaml` names one. No
+credentials, no experiments clone, no boto3; downloads retry and resume. It warns if the README's
+resolved count differs from `results.json`.
 
-## Step 2: strengthened-test labels (Docker, Linux x86)
+`orig` = not in the `resolved` list. Instances the agent produced no patch for (`no_generation`) are
+kept as gated, wrong patches; instances you did not download (a `--limit` pilot) are left out.
+Add `--judge muse-spark` to `submission` for the LLM-judge signal (one call per patch).
 
-Run the SWE-ABS harness (github.com/OpenAgentEval/SWE-ABS) on the same submission folders; its
-README shows the command (`python -m swebench.runtest.run_evaluation_test ... --vaild_model_name
-<submission>`). Then merge its output:
+The fallback, if you already have a folder from the experiments repository's own
+`python -m analysis.download_logs`: point `submission` at it; `--preds <file>` if predictions sit elsewhere.
+
+## Step 2 · Oracle 2: strengthened-test labels (Linux x86 + Docker)
+
+The `fetch` output folder is exactly what the SWE-ABS harness reads
+(`<root>/<submission>/logs/<instance>/{report.json,patch.diff}`). On the Linux machine:
 
 ```bash
-keel eval abs-labels results/agents/<submission>.jsonl \
-    --final-results swe-bench/swe_abs_res/eval_agent/<run_id>/final_results.json
+git clone https://github.com/OpenAgentEval/SWE-ABS && cd SWE-ABS
+conda create -n swe-abs python=3.11 -y && conda activate swe-abs && bash setup.sh
+pip install -e /path/to/keel_01                                     # Keel in the same environment
+cd /path/to/keel_01
+keel eval abs-run --models-root data/submissions --models 20250807_openhands_gpt5 \
+    --run-id pilot --pilot 20 --sweabs-dir ~/SWE-ABS                # 20 instances first
+keel eval abs-run --models-root data/submissions --models 20250807_openhands_gpt5,<other> \
+    --run-id full --sweabs-dir ~/SWE-ABS                            # then everything
+keel eval abs-labels results/agents/20250807_openhands_gpt5.jsonl --sweabs-dir ~/SWE-ABS --run-id full
 ```
 
-If the generator name differs from the SWE-ABS model key, pass `--key-map map.json`
-(`{"<generator>": "<model key>"}`). A patch that fails the original tests stays wrong (strengthened
-tests only add tests); the command reports how often the two runs disagree that way, which is an
-environment check worth reporting.
+Without `--sweabs-dir`, `abs-run` only prints the command (run it yourself from `SWE-ABS/swe-bench`).
+SWE-ABS evaluates only instances the original run resolved; the others go to its `init_fail` and stay
+wrong in Keel. `abs-labels` reports `flipped_to_wrong` (silent failures caught by the stronger tests),
+`abs_pass_but_orig_fail` (should be about 0: an environment check), `missing`, and SWE-ABS errors.
+If generator names differ from the SWE-ABS model keys, pass `--key-map map.json`.
 
-## Step 3: human audit
+## Step 3 · Oracle 3: human audit
 
 ```bash
-keel eval audit-export results/agents/*.jsonl --dataset verified --out results/audit
+keel eval audit-export results/agents/*.jsonl --instances results/verified.jsonl --out results/audit
 ```
 
-This writes one Markdown file per item (issue, patch, reference patch, checklist), a blind
-`sheet.csv` for the raters and a private `key.csv`. Only audit-pool patches (a fixed 25% of issues,
-chosen by hash) that pass an oracle are listed; patches the tests already reject count as wrong.
-About 30% of items are marked for a second rater. Fill `rater_1`, `rater_2` and, for disagreements,
-`final` with `correct`, `wrong` or `unsure`, then:
+This writes `items/<id>.md` (issue, patch, reference patch, checklist), `rater1.csv` (every item),
+`rater2.csv` (about 30%, for agreement) and a private `key.csv`. Give each rater `items/` and only
+their own sheet; they fill `verdict` with `correct`, `wrong` or `unsure` without seeing each other's.
+Only audit-pool patches (a fixed 25% of issues, chosen by hash) that pass an oracle are listed;
+patches the tests already reject count as wrong. Re-running the export keeps verdicts already entered.
 
 ```bash
-keel eval audit-import results/agents/<submission>.jsonl --audit results/audit
+keel eval audit-status --audit results/audit      # progress, kappa; writes adjudication.csv for disagreements
+# a third person fills `final` in adjudication.csv
+keel eval audit-import results/agents/<submission>.jsonl --audit results/audit   # once per agent file
+keel eval labels-status results/agents/*.jsonl    # labels per oracle; which variants can run
 ```
 
-It prints Cohen's kappa and refuses nothing, but warns below 0.6. `unsure` counts as wrong unless
-`--unsure-as-missing`.
+`unsure` counts as wrong unless `--unsure-as-missing`. Do not change `--audit-frac` after exporting.
 
 ## Step 4: experiments
 
@@ -104,6 +124,6 @@ of oracles. RQ2 (which signals separate silent failures) uses the same records; 
 
 ## What is not automated
 
-* Running the SWE-ABS harness (Docker, outside this repository).
+* Docker itself: `abs-run` drives the SWE-ABS harness but needs a Linux x86 machine with Docker.
 * The human verdicts.
 * Variant C (prediction-powered inference, Einbinder et al., TPAMI 2025) is not implemented.

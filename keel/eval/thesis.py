@@ -182,3 +182,19 @@ def audit_budget_curve(records: list[dict], budgets: list[int], alpha: float = 0
                 row[f"{v}_fdr"] = r["fdr"]
         out.append(row)
     return out
+
+
+def readiness(records: list[dict], audit_frac: float = 0.25, salt: str = "keel-audit") -> dict:
+    """Which oracles are complete, and which thesis variants can run on these records."""
+    cs = [c for r in records for c in r["candidates"]]
+    counts = {o: sum(rec_label(c, o) is not None for c in cs) for o in ("orig", "abs", "human")}
+    need = {}
+    for o in ("orig", "abs"):
+        reqs = audit_requests(records, audit_frac, (o,), salt)
+        cands = {(r["task_id"], c["candidate_id"]): c for r in records for c in r["candidates"]}
+        need[o] = sum(1 for q in reqs if rec_label(cands[(q["task_id"], q["candidate_id"])], "human") is None)
+    abs_complete = counts["abs"] == len(cs)
+    return {"candidates": len(cs), "labels": counts,
+            "audit_missing_for_A": need["orig"], "audit_missing_for_B": need["abs"] if abs_complete else None,
+            "can_run": {"plain": True, "plain_abs": abs_complete, "A": need["orig"] == 0,
+                        "B": abs_complete and need["abs"] == 0}}

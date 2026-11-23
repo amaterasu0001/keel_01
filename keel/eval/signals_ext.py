@@ -6,6 +6,7 @@ trajectory. The LLM-judge signal is optional and calls any Keel generator.
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
@@ -74,6 +75,37 @@ _VIEW_CMD = re.compile(r"^\s*(open|cat|less|head|tail|sed -n|view|str_replace_ed
 _EDIT_CMD = re.compile(r"^\s*(edit|str_replace_editor (?:str_replace|create|insert)|create|insert|apply_patch)\b")
 
 
+def _parse_maybe(x):
+    """JSON, or a Python-repr string of a list/dict (OpenHands exports both), or the value itself."""
+    if not isinstance(x, str):
+        return x
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return loader(x)
+        except (ValueError, SyntaxError, TypeError):
+            continue
+    return x
+
+
+def _tool_call_actions(calls) -> list[str]:
+    """OpenAI-style tool calls -> 'execute_bash pytest -q', 'str_replace_editor view path', ..."""
+    out = []
+    for call in _parse_maybe(calls) or []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        name = fn.get("name") or call.get("name") or ""
+        args = _parse_maybe(fn.get("arguments") or call.get("arguments") or {})
+        if isinstance(args, dict):
+            if name in ("execute_bash", "bash", "run", "shell"):
+                out.append(str(args.get("command", "")))
+            else:
+                out.append(" ".join(str(x) for x in (name, args.get("command", ""), args.get("path", "")) if x))
+        else:
+            out.append(f"{name} {args}")
+    return out
+
+
 def _actions(traj) -> list[str]:
     """Best effort over common formats (SWE-agent .traj, OpenHands / mini-SWE-agent histories)."""
     if isinstance(traj, dict):
@@ -88,14 +120,20 @@ def _actions(traj) -> list[str]:
     out = []
     for step in traj:
         if isinstance(step, dict):
+            if step.get("tool_calls"):
+                out += _tool_call_actions(step["tool_calls"])
+                continue
             a = step.get("action") or step.get("command") or ""
             if not a and step.get("role") == "assistant":
-                a = step.get("content") or ""
+                content = _parse_maybe(step.get("content") or "")
+                if isinstance(content, list):  # [{"type": "text", "text": ...}]
+                    content = " ".join(str(c.get("text", "")) if isinstance(c, dict) else str(c) for c in content)
+                a = content
             if isinstance(a, dict):
                 a = json.dumps(a)
             if isinstance(a, list):
                 a = " ".join(str(x) for x in a)
-            if a:
+            if a and str(a).strip():
                 out.append(str(a))
         elif isinstance(step, str):
             out.append(step)

@@ -185,11 +185,12 @@ def _submission(tmp_path):
     (sub / "all_preds.jsonl").write_text(
         json.dumps({"instance_id": "o__r-1", "model_patch": DIFF}) + "\n"
         + json.dumps({"instance_id": "o__r-2", "model_patch": DIFF}) + "\n")
-    (sub / "results" / "results.json").write_text(json.dumps({"resolved": ["o__r-1"], "no_apply": []}))
+    (sub / "results" / "results.json").write_text(json.dumps({"resolved": ["o__r-1"], "no_apply": [],
+                                                              "no_generation": ["o__r-3"]}))
     (sub / "trajs" / "o__r-1.traj").write_text(json.dumps({"trajectory": [
         {"action": "open pkg/core.py"}, {"action": "edit 1:3"}, {"action": "python -m pytest tests"}]}))
     insts = {i: {"instance_id": i, "repo": "o/r", "problem_statement": "parse_header keeps spaces in core.py",
-                 "patch": DIFF} for i in ("o__r-1", "o__r-2", "o__r-3")}
+                 "patch": DIFF} for i in ("o__r-1", "o__r-2", "o__r-3", "o__r-4")}  # o__r-4: not downloaded
     return sub, insts
 
 
@@ -198,10 +199,21 @@ def test_load_submission_labels_and_features(tmp_path):
     recs = experiments_repo.load_submission(sub, insts, log=lambda m: None)
     by = {r["task_id"]: r["candidates"][0] for r in recs}
     assert by["o__r-1"]["wrong"] is False and by["o__r-2"]["wrong"] is True
-    assert by["o__r-3"]["gates"] == ["no_patch"]
+    assert by["o__r-3"]["gates"] == ["no_patch"] and "o__r-4" not in by
     f = by["o__r-1"]["features"]
     assert f["has_traj"] == 1.0 and f["traj_test_runs"] == 1.0 and f["issue_file_mention"] == 1.0
     assert set(sx.EXTERNAL_FEATURES) <= set(f)
+
+
+def test_load_submission_from_logs_patch_diff(tmp_path):
+    sub, insts = _submission(tmp_path)
+    (sub / "all_preds.jsonl").unlink()  # the experiments repo itself has no predictions file
+    for iid in ("o__r-1", "o__r-2"):
+        (sub / "logs" / iid).mkdir(parents=True)
+        (sub / "logs" / iid / "patch.diff").write_text(DIFF)
+    recs = experiments_repo.load_submission(sub, insts, log=lambda m: None)
+    by = {r["task_id"]: r["candidates"][0] for r in recs}
+    assert by["o__r-1"]["diff"] == DIFF and by["o__r-3"]["gates"] == ["no_patch"]
 
 
 def test_abs_merge_is_monotone(tmp_path):
@@ -217,24 +229,150 @@ def test_abs_merge_is_monotone(tmp_path):
     assert st["flipped_to_wrong"] == 1 and st["abs_pass_but_orig_fail"] == 1
 
 
-def test_audit_roundtrip_and_kappa(tmp_path):
-    recs = simulate(200, seed=1)
-    insts = {r["task_id"]: {"repo": "sim", "problem_statement": "x", "patch": ""} for r in recs}
-    st = audit.export(recs, insts, tmp_path / "aud", audit_frac=0.3, oracles=("orig",))
-    reqs = audit_requests(recs, 0.3, ("orig",))
-    assert st["items"] == len(reqs) > 0
-    rows = list(__import__("csv").DictReader(open(tmp_path / "aud" / "sheet.csv", encoding="utf-8")))
+def _fill(path, fn):
+    import csv
+    rows = list(csv.DictReader(open(path, encoding="utf-8")))
     for i, r in enumerate(rows):
-        r["rater_1"] = "correct" if i % 3 else "wrong"
-        if r["rater_2"] != "-":
-            r["rater_2"] = r["rater_1"]
-    with open(tmp_path / "aud" / "sheet.csv", "w", newline="", encoding="utf-8") as f:
-        w = __import__("csv").DictWriter(f, fieldnames=audit.SHEET_FIELDS)
+        fn(i, r)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
-    res = audit.import_verdicts(recs, tmp_path / "aud")
-    assert res["labelled"] == len(rows) and res["kappa"] == 1.0
+    return rows
+
+
+def test_audit_two_raters_status_adjudication_import(tmp_path):
+    recs = simulate(200, seed=1)
+    insts = {r["task_id"]: {"repo": "sim", "problem_statement": "x", "patch": ""} for r in recs}
+    d = tmp_path / "aud"
+    st = audit.export(recs, insts, d, audit_frac=0.3, oracles=("orig",))
+    assert st["items"] == len(audit_requests(recs, 0.3, ("orig",))) > 0 and 0 < st["double_rated"] < st["items"]
+    r1 = _fill(d / "rater1.csv", lambda i, r: r.update(verdict="correct" if i % 3 else "wrong"))
+    first = {r["audit_id"]: r["verdict"] for r in r1}
+    # rater 2 agrees except on the first double-rated item
+    _fill(d / "rater2.csv", lambda i, r: r.update(verdict=first[r["audit_id"]] if i else
+                                                  ("wrong" if first[r["audit_id"]] == "correct" else "correct")))
+    s1 = audit.audit_status(d)
+    assert s1["disagreements"] == 1 and s1["adjudicated"] == 0 and not s1["ready"]
+    assert (d / "adjudication.csv").exists()
+    pre = audit.import_verdicts(recs, d)
+    assert pre["disagreements_unresolved"] == 1
+    _fill(d / "adjudication.csv", lambda i, r: r.update(final="wrong"))
+    s2 = audit.audit_status(d)
+    assert s2["ready"] and s2["adjudicated"] == 1
+    res = audit.import_verdicts(recs, d)
+    assert res["labelled"] == st["items"] and res["disagreements_unresolved"] == 0
+    # re-exporting keeps entered verdicts
+    audit.export(recs, insts, d, audit_frac=0.3, oracles=("orig",))
+    assert audit.audit_status(d)["rater1_done"] == st["items"]
     assert audit.cohen_kappa(["a", "b", "a", "b"], ["a", "a", "b", "b"]) == 0.0
+
+
+def test_audit_reads_legacy_sheet(tmp_path):
+    import csv
+    recs = simulate(120, seed=2)
+    d = tmp_path / "aud"
+    audit.export(recs, {}, d, audit_frac=0.3, oracles=("orig",))
+    ids = [r["audit_id"] for r in csv.DictReader(open(d / "rater1.csv", encoding="utf-8"))]
+    (d / "rater1.csv").unlink()
+    (d / "rater2.csv").unlink()
+    with open(d / "sheet.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=audit.SHEET_FIELDS)
+        w.writeheader()
+        w.writerows([{"audit_id": i, "rater_1": "c", "rater_2": "-", "final": "", "notes": ""} for i in ids])
+    assert audit.import_verdicts(recs, d)["labelled"] == len(ids)
+
+
+# --- fetch / SWE-ABS / readiness -----------------------------------------------------------------
+
+def _fake_s3(files: dict[str, bytes]):
+    """A getter serving RAW and S3 URLs from a dict keyed by '<split>/<name>/<rest>'."""
+    from urllib.parse import parse_qs, urlparse
+
+    from keel.eval import fetch as fe
+
+    def get(url):
+        if url.startswith(fe.RAW):
+            return files.get(url[len(fe.RAW) + 1:])
+        if url.startswith(fe.S3 + "/?"):
+            prefix = parse_qs(urlparse(url).query)["prefix"][0]
+            keys = "".join(f"<Contents><Key>{k}</Key></Contents>" for k in sorted(files) if k.startswith(prefix))
+            return (f'<?xml version="1.0"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                    f"{keys}<IsTruncated>false</IsTruncated></ListBucketResult>").encode()
+        return files.get(url[len(fe.S3) + 1:])
+    return get
+
+
+def test_fetch_builds_the_shared_layout(tmp_path):
+    from keel.eval import fetch as fe
+    base = "verified/20250101_agent"
+    rep = json.dumps({"o__r-1": {"resolved": True}}).encode()
+    files = {f"{base}/results/results.json": json.dumps({"resolved": ["o__r-1"]}).encode(),
+             f"{base}/README.md": b"Resolved 1 instances (50%).",
+             f"{base}/metadata.yaml": b"assets:\n  logs: s3://swe-bench-submissions/verified/x/logs\n",
+             f"{base}/logs/o__r-1/patch.diff": DIFF.encode(), f"{base}/logs/o__r-1/report.json": rep,
+             f"{base}/logs/o__r-1/test_output.txt": b"big", f"{base}/logs/o__r-2/patch.diff": DIFF.encode(),
+             f"{base}/logs/o__r-2/report.json": b"{}"}
+    s = fe.fetch_submission("20250101_agent", tmp_path, get=_fake_s3(files), instances={"o__r-1"},
+                            log=lambda m: None)
+    root = tmp_path / "20250101_agent"
+    assert s["patches"] == 1 and s["resolved"] == 1 and s["readme_resolved"] == 1
+    assert (root / "logs/o__r-1/report.json").exists() and not (root / "logs/o__r-1/test_output.txt").exists()
+    assert not (root / "logs/o__r-2").exists()
+    # resumable: nothing new on a second run
+    assert fe.fetch_submission("20250101_agent", tmp_path, get=_fake_s3(files), instances={"o__r-1"},
+                               log=lambda m: None)["files_downloaded"] == 0
+    # the same folder feeds Oracle 1 and passes the SWE-ABS layout check
+    insts = {"o__r-1": {"instance_id": "o__r-1", "problem_statement": "x"}}
+    recs = experiments_repo.load_submission(root, insts, log=lambda m: None)
+    assert recs[0]["candidates"][0]["wrong"] is False
+    assert abs_labels.check_layout(tmp_path, ["20250101_agent"]) == {"20250101_agent": 1}
+
+
+def test_metadata_and_readme_parsing():
+    from keel.eval import fetch as fe
+    meta = "name: x\nassets:\n  repo: https://github.com/someone/run\n  logs: s3://b/l\nother: 1\n"
+    assert fe.assets_repo(meta) == "https://github.com/someone/run"
+    assert fe.assets_repo("assets:\n  logs: s3://b/l\n") is None
+    assert fe.readme_resolved("We resolved 359 instances (71.8%)") == 359
+
+
+def test_abs_command_pilot_and_problems(tmp_path):
+    m = tmp_path / "20250101_agent"
+    (m / "results").mkdir(parents=True)
+    (m / "results" / "results.json").write_text(json.dumps({"resolved": ["b", "a", "c"]}))
+    assert abs_labels.resolved_instances(m) == ["a", "b", "c"]
+    for i in ("b", "c"):
+        (m / "logs" / i).mkdir(parents=True)
+        (m / "logs" / i / "report.json").write_text("{}")
+    (m / "logs" / "b" / "patch.diff").write_text(DIFF)
+    assert abs_labels.ready_instances(m) == ["b"]  # a not downloaded, c has no patch.diff
+    cmd = abs_labels.abs_command(tmp_path, ["20250101_agent"], "run1", ["a", "b"], workers=4, timeout=600)
+    assert cmd[cmd.index("--vaild_model_name") + 1] == "20250101_agent"
+    assert cmd[cmd.index("--instance_ids") + 1] == "a,b" and "--re_run_eval" not in cmd
+    assert abs_labels.final_results_path("/x/SWE-ABS", "run1").as_posix().endswith(
+        "SWE-ABS/swe-bench/swe_abs_res/eval_agent/run1/final_results.json")
+    fr = tmp_path / "final.json"
+    fr.write_text(json.dumps({"a": {"pass": ["20250101_agent"], "fail": [], "init_fail": [], "error": [],
+                                    "gold_state": {}, "20250101_agent": []},
+                              "b": {"pass": [], "fail": [], "init_fail": [], "gold_state": {},
+                                    "error": [["20250101_agent", "boom"]]}}))
+    assert abs_labels.read_final_results(fr) == {"a": {"20250101_agent": False}, "b": {}}
+    assert abs_labels.final_results_problems(fr)["20250101_agent"]["error"] == ["b"]
+
+
+def test_readiness_reports_what_can_run():
+    from keel.eval.thesis import readiness
+    recs = simulate(150, seed=3)
+    for r in recs:
+        for c in r["candidates"]:
+            c["labels"]["human"] = None
+    st = readiness(recs, 0.25)
+    assert st["can_run"]["plain"] and not st["can_run"]["A"] and st["audit_missing_for_A"] > 0
+    for r in recs:
+        for c in r["candidates"]:
+            c["labels"]["human"] = c["labels"]["true"]
+    assert readiness(recs, 0.25)["can_run"] == {"plain": True, "plain_abs": True, "A": True, "B": True}
 
 
 def test_issue_and_trajectory_features():
@@ -281,3 +419,16 @@ def test_thesis_cli_end_to_end(tmp_path):
     res = json.loads((tmp_path / "out" / "results.json").read_text())
     assert res["eval_label"] == "true" and "A" in res["correction"]["methods"] and res["budget"]
     assert (tmp_path / "out" / "rq1_inflation.svg").exists() and (tmp_path / "out" / "README.md").exists()
+
+
+def test_openhands_tool_call_trajectory():
+    traj = [{"role": "system", "content": "..."},
+            {"role": "assistant", "content": "[]", "tool_calls": str([{"type": "function", "function": {
+                "name": "execute_bash", "arguments": '{"command": "python -m pytest tests/test_x.py"}'}}])},
+            {"role": "tool", "content": "ok"},
+            {"role": "assistant", "content": "[]", "tool_calls": [{"type": "function", "function": {
+                "name": "str_replace_editor", "arguments": '{"command": "view", "path": "/w/pkg/core.py"}'}}]},
+            {"role": "assistant", "content": "[]", "tool_calls": [{"type": "function", "function": {
+                "name": "str_replace_editor", "arguments": '{"command": "str_replace", "path": "/w/pkg/core.py"}'}}]}]
+    f = sx.trajectory_features(traj)
+    assert f["traj_test_runs"] == 1.0 and f["traj_edit_steps"] == 1.0 and f["traj_log_files_viewed"] > 0
