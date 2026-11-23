@@ -17,6 +17,7 @@ class KeelConfig:
     alpha: float = 0.1
     method: str = "crc"           # crc | ltt
     delta: float = 0.1
+    beta: float = 0.1             # reject tier: at most this share of rejected patches may be correct
     k: int = 5
     temperature: float = 0.8
     models: list[str] = field(default_factory=lambda: ["muse-spark", "muse-spark-open"])
@@ -42,4 +43,6 @@ class KeelConfig:
             raise ValueError(f".keel.toml: method must be 'crc' or 'ltt', got {cfg.method!r}")
         if not 0 < cfg.alpha < 1:
             raise ValueError(".keel.toml: alpha must be in (0, 1)")
+        if not 0 < cfg.beta < 1:
+            raise ValueError(".keel.toml: beta must be in (0, 1)")
         return cfg

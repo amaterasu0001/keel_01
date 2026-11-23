@@ -10,6 +10,8 @@ from .. import conformal
 from ..baselines import BASELINES
 from ..features import FEATURE_NAMES
 from ..scoring import Scorer
+from .records import ORACLES, has_oracle
+from .records import label as rec_label
 
 DEFAULT_ALPHAS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]
 
@@ -27,16 +29,33 @@ FEATURE_GROUPS = {
 @dataclass
 class SplitResult:
     cal: list[tuple[float, bool]]
-    test: list[dict]  # selected candidate per test bug: {"score", "wrong", "gates", "features"}
+    test: list[dict]  # selected candidate per test bug: {"score", "wrong", "gates", "features", "labels"}
+    grid: list[float] | None = None  # LTT grid from the fit split (independent of calibration)
+    cal_sel: list[dict] | None = None
+    fit_sel: list[dict] | None = None
+
+    def ordered_grid(self, oracle: str, delta: float, n_audit: int = 0, delta2: float = 0.0) -> list[float]:
+        """The fit-split-ordered grid for fixed-sequence LTT (see conformal.order_grid)."""
+        fs = [x["score"] for x in self.fit_sel or []]
+        fw = [bool(x["labels"][oracle]) if x["labels"][oracle] is not None else False for x in self.fit_sel or []]
+        return conformal.order_grid(self.grid or conformal.LTT_GRID, fs, fw, len(self.cal), delta, n_audit, delta2)
 
 
 def score_and_select(records: list[dict], scorer: Scorer) -> list[dict]:
-    """Per bug: score every candidate, return the selected one (same rule as the pipeline)."""
+    """Per bug: score every candidate, return the selected one (same rule as the pipeline).
+
+    "wrong" is the primary (held-out test) label; "labels" holds the selected patch's label under
+    every oracle (None where that oracle has no label).
+    """
     out = []
+    flat = [c for r in records for c in r["candidates"]]
+    all_scores = scorer.score_many([c["features"] for c in flat], [bool(c["gates"]) for c in flat])
+    pos = 0
     for r in records:
         best = None
         for c in r["candidates"]:
-            s = scorer.score(c["features"], c["gates"])
+            s = all_scores[pos]
+            pos += 1
             key = (s, -c["features"].get("behavior_agreement", 0.0), c["features"].get("log_diff_size", 0.0),
                    c["candidate_id"])
             if best is None or key < best[0]:
@@ -44,18 +63,22 @@ def score_and_select(records: list[dict], scorer: Scorer) -> list[dict]:
         _, c, s = best
         out.append({"task_id": r["task_id"], "score": s, "wrong": bool(c["wrong"]), "gates": c["gates"],
                     "features": c["features"], "generator": c["generator"],
+                    "candidate_id": c["candidate_id"],
+                    "labels": {o: rec_label(c, o) for o in ORACLES},
                     "cost_usd": sum(x.get("cost_usd", 0.0) for x in r["candidates"])})
     return out
 
 
-def fit_scorer(records: list[dict], features: list[str] | None = None) -> Scorer:
+def fit_scorer(records: list[dict], features: list[str] | None = None, label: str = "orig") -> Scorer:
+    """Fit the scorer on non-gated candidates; `label` picks the oracle used as training target."""
     feats = features or list(FEATURE_NAMES)
     X, y = [], []
     for r in records:
         for c in r["candidates"]:
-            if not c["gates"]:
+            lab = rec_label(c, label)
+            if not c["gates"] and lab is not None:
                 X.append(c["features"])
-                y.append(0 if c["wrong"] else 1)
+                y.append(0 if lab else 1)
     scorer = Scorer(feature_names=feats, weights=[0.0] * len(feats), means=[0.0] * len(feats),
                     stds=[1.0] * len(feats))
     return scorer.fit(X, y)
@@ -70,11 +93,15 @@ def split(records: list[dict], rng: random.Random, fracs=(0.3, 0.35)) -> tuple[l
     return pick(idx[:a]), pick(idx[a:b]), pick(idx[b:])
 
 
-def run_split(records: list[dict], rng: random.Random, features: list[str] | None = None) -> SplitResult:
+def run_split(records: list[dict], rng: random.Random, features: list[str] | None = None,
+              fit_label: str = "orig", cal_label: str = "orig") -> SplitResult:
     fit, cal, test = split(records, rng)
-    scorer = fit_scorer(fit, features)
+    scorer = fit_scorer(fit, features, fit_label)
+    fit_sel = score_and_select(fit, scorer)
+    grid = conformal.grid_from_scores([x["score"] for x in fit_sel])
     cal_sel = score_and_select(cal, scorer)
-    return SplitResult(cal=[(x["score"], x["wrong"]) for x in cal_sel], test=score_and_select(test, scorer))
+    return SplitResult(cal=[(x["score"], bool(x["labels"][cal_label])) for x in cal_sel],
+                       test=score_and_select(test, scorer), grid=grid, cal_sel=cal_sel, fit_sel=fit_sel)
 
 
 def _mean_sd(xs: list[float]) -> tuple[float, float]:
@@ -94,52 +121,82 @@ def auroc(scores: list[float], wrong: list[bool]) -> float:
     return wins / (len(pos) * len(neg))
 
 
-def evaluate(records: list[dict], alphas: list[float] | None = None, n_splits: int = 200, delta: float = 0.1,
-             seed: int = 0, features: list[str] | None = None) -> dict:
-    """Risk, FDR and merge rate of Keel (CRC, LTT) and the baselines, over random splits."""
-    alphas = alphas or DEFAULT_ALPHAS
-    rng = random.Random(seed)
-    acc: dict[str, dict[float, dict[str, list[float]]]] = {}
-    aucs: list[float] = []
+class Accumulator:
+    """Per-method, per-alpha risk / false-merge rate / merge rate and violation frequencies."""
 
-    def add(method: str, alpha: float, merged: list[bool], test: list[dict]) -> None:
-        n = len(test)
+    def __init__(self) -> None:
+        self.acc: dict[str, dict[float, dict[str, list[float]]]] = {}
+
+    def add(self, method: str, alpha: float, merged: list[bool], wrong: list[bool]) -> None:
+        n = len(wrong)
         k = sum(merged)
-        w = sum(1 for m, t in zip(merged, test) if m and t["wrong"])
-        slot = acc.setdefault(method, {}).setdefault(alpha, {"risk": [], "fdr": [], "merge": [], "viol_risk": [],
-                                                             "viol_fdr": []})
-        slot["risk"].append(w / n)
+        w = sum(1 for m, bad in zip(merged, wrong) if m and bad)
+        slot = self.acc.setdefault(method, {}).setdefault(alpha, {"risk": [], "fdr": [], "merge": [], "viol_risk": [],
+                                                                  "viol_fdr": []})
+        slot["risk"].append(w / n if n else 0.0)
         slot["fdr"].append(w / k if k else 0.0)
-        slot["merge"].append(k / n)
-        slot["viol_risk"].append(float(w / n > alpha))
+        slot["merge"].append(k / n if n else 0.0)
+        slot["viol_risk"].append(float(n > 0 and w / n > alpha))
         slot["viol_fdr"].append(float(k > 0 and w / k > alpha))
 
-    for _ in range(n_splits):
-        sr = run_split(records, rng, features)
-        cs, cw = [s for s, _ in sr.cal], [w for _, w in sr.cal]
-        aucs.append(auroc([t["score"] for t in sr.test], [t["wrong"] for t in sr.test]))
-        for alpha in alphas:
-            for method in ("crc", "ltt"):
-                thr = conformal.threshold(method, cs, cw, alpha, delta)
-                add(f"keel_{method}", alpha, [t["score"] <= thr and t["score"] < 1 for t in sr.test], sr.test)
-            for name, rule in BASELINES.items():
-                add(name, alpha, [rule(t, alpha) for t in sr.test], sr.test)
-            add("oracle", alpha, [not t["wrong"] and not t["gates"] for t in sr.test], sr.test)
+    def summary(self, alphas: list[float]) -> dict:
+        out = {}
+        for method, by_alpha in self.acc.items():
+            out[method] = []
+            for alpha in alphas:
+                s = by_alpha.get(alpha)
+                if not s:
+                    continue
+                reps = len(s["risk"])
+                rm, rsd = _mean_sd(s["risk"])
+                fm, fsd = _mean_sd(s["fdr"])
+                mm, msd = _mean_sd(s["merge"])
+                out[method].append({"alpha": alpha, "risk": rm, "risk_sd": rsd, "fdr": fm, "fdr_sd": fsd,
+                                    "merge": mm, "merge_sd": msd, "viol_risk": sum(s["viol_risk"]) / reps,
+                                    "viol_fdr": sum(s["viol_fdr"]) / reps})
+        return out
 
-    summary = {}
-    for method, by_alpha in acc.items():
-        summary[method] = []
+
+def _require(records: list[dict], oracle: str, what: str) -> None:
+    if not has_oracle(records, oracle):
+        raise ValueError(f"{what} oracle {oracle!r} is missing on some candidates; add those labels first "
+                         f"(keel eval labels ...) or pick another oracle")
+
+
+def evaluate(records: list[dict], alphas: list[float] | None = None, n_splits: int = 200, delta: float = 0.1,
+             seed: int = 0, features: list[str] | None = None, cal_label: str = "orig",
+             eval_label: str = "orig") -> dict:
+    """Risk, false-merge rate and merge rate of Keel (CRC, LTT) and the baselines, over random splits.
+
+    The scorer is fit and the threshold calibrated on `cal_label`; realised error is measured on
+    the test split with `eval_label`. Calibrating on "orig" and evaluating on "abs" / "human" / "true"
+    measures how much an imperfect oracle inflates the guarantee (thesis RQ1).
+    """
+    alphas = alphas or DEFAULT_ALPHAS
+    _require(records, cal_label, "calibration")
+    _require(records, eval_label, "evaluation")
+    rng = random.Random(seed)
+    acc = Accumulator()
+    aucs: list[float] = []
+
+    for _ in range(n_splits):
+        sr = run_split(records, rng, features, fit_label=cal_label, cal_label=cal_label)
+        cs, cw = [s for s, _ in sr.cal], [w for _, w in sr.cal]
+        tw = [bool(t["labels"][eval_label]) for t in sr.test]
+        aucs.append(auroc([t["score"] for t in sr.test], tw))
+        grids = {"crc": None, "ltt": sr.ordered_grid(cal_label, delta), "ltt_bonferroni": sr.grid}
         for alpha in alphas:
-            s = by_alpha[alpha]
-            rm, rsd = _mean_sd(s["risk"])
-            fm, fsd = _mean_sd(s["fdr"])
-            mm, msd = _mean_sd(s["merge"])
-            summary[method].append({"alpha": alpha, "risk": rm, "risk_sd": rsd, "fdr": fm, "fdr_sd": fsd,
-                                    "merge": mm, "merge_sd": msd, "viol_risk": sum(s["viol_risk"]) / n_splits,
-                                    "viol_fdr": sum(s["viol_fdr"]) / n_splits})
+            for method in ("crc", "ltt", "ltt_bonferroni"):
+                thr = conformal.threshold(method, cs, cw, alpha, delta, grids[method])
+                acc.add(f"keel_{method}", alpha, [t["score"] <= thr and t["score"] < 1 for t in sr.test], tw)
+            for name, rule in BASELINES.items():
+                acc.add(name, alpha, [rule(t, alpha) for t in sr.test], tw)
+            acc.add("oracle", alpha, [not w and not t["gates"] for w, t in zip(tw, sr.test)], tw)
+
     finite = [a for a in aucs if not math.isnan(a)]
     return {"alphas": alphas, "n_splits": n_splits, "delta": delta, "n_bugs": len(records),
-            "auroc": _mean_sd(finite)[0] if finite else None, "methods": summary}
+            "cal_label": cal_label, "eval_label": eval_label,
+            "auroc": _mean_sd(finite)[0] if finite else None, "methods": acc.summary(alphas)}
 
 
 def slider_data(records: list[dict], seed: int = 0) -> dict:

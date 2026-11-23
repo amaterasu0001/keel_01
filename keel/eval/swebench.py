@@ -35,6 +35,8 @@ from ..types import BugTask, Candidate, CandidateEvaluation
 from . import records as rec_io
 
 DATASET = "SWE-bench/SWE-bench_Lite"
+VERIFIED = "SWE-bench/SWE-bench_Verified"
+DATASETS = {"lite": DATASET, "verified": VERIFIED}
 ROWS_API = "https://datasets-server.huggingface.co/rows"
 
 
@@ -139,7 +141,7 @@ def _report(workdir: Path, run_id: str, instance_id: str) -> dict | None:
 
 
 def stage_records(instances: list[dict], cand_file: Path, workdir: Path, cache: Path, scorer_pipeline: Pipeline,
-                  out: Path, log=print) -> None:
+                  out: Path, log=print, dataset_label: str = "swebench-lite") -> None:
     by_id = {i["instance_id"]: i for i in instances}
     rows = [json.loads(ln) for ln in cand_file.read_text().splitlines() if ln.strip()]
     records = []
@@ -173,10 +175,12 @@ def stage_records(instances: list[dict], cand_file: Path, workdir: Path, cache: 
                 evals.append(ev)
                 labels.append(resolved)
         compute_features(task, evals)
-        records.append({"task_id": inst["instance_id"], "dataset": "swebench-lite", "simulated": False,
+        records.append({"task_id": inst["instance_id"], "dataset": dataset_label, "simulated": False,
                         "failing_tests": task.failing_tests,
                         "candidates": [{"candidate_id": e.candidate.candidate_id, "generator": e.candidate.generator,
                                         "features": e.features, "gates": e.gate_failures, "wrong": not lab,
+                                        "labels": {"orig": not lab, "abs": None, "human": None},
+                                        "diff": e.candidate.diff,
                                         "cost_usd": e.candidate.cost_usd, "diff_hash": ""}
                                        for e, lab in zip(evals, labels)]})
         log(f"{inst['instance_id']}: {sum(labels)}/{len(labels)} candidates resolve the issue")

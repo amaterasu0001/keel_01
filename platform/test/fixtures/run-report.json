@@ -354,7 +354,7 @@
   "tests/test_pricing.py::test_ten_percent_discount"
  ],
  "finished_at": "2026-10-29T12:06:00+00:00",
- "guarantee": "Conformal risk control on 0 held-out bugs: in expectation, at most 10% of bugs end up with a wrong patch auto-merged.",
+ "guarantee": "Conformal risk control on 0 held-out bugs: in expectation, at most 10% of ALL bugs end up with a wrong patch auto-merged (a bound on wrong merges per bug, not per merge).",
  "method": "crc",
  "n_calibration": 0,
  "n_candidates": 10,

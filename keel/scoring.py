@@ -66,6 +66,15 @@ class Scorer:
             return 1.0
         return 1.0 - self.prob_correct(feats)
 
+    def score_many(self, feats: list[dict[str, float]], gated: list[bool]) -> list[float]:
+        """Vectorised `score` for many candidates (same result, much faster in the evaluation loops)."""
+        if not feats:
+            return []
+        A = np.array([[f.get(n, 0.0) for n in self.feature_names] for f in feats], dtype=float)
+        z = ((A - np.array(self.means)) / np.array(self.stds)) @ np.array(self.weights) + self.bias
+        p = 1.0 / (1.0 + np.exp(-np.clip(z, -50.0, 50.0)))
+        return [1.0 if g else float(1.0 - pi) for pi, g in zip(p, gated)]
+
     def contributions(self, feats: dict[str, float]) -> dict[str, float]:
         """Per-feature contribution to the log-odds of being correct."""
         z = self._z(feats)

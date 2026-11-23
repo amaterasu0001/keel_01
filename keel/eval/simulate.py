@@ -25,8 +25,20 @@ def _sig(x: float) -> float:
     return 1 / (1 + math.exp(-x))
 
 
-def simulate(n_bugs: int = 300, k: int = 5, seed: int = 0, models: dict | None = None) -> list[dict]:
+def simulate(n_bugs: int = 300, k: int = 5, seed: int = 0, models: dict | None = None,
+             eps_fc: float = 0.0, eps_fw: float = 0.0, abs_catch: float = 0.7, human_error: float = 0.0) -> list[dict]:
+    """Simulated records. With oracle noise, `wrong` is what the held-out tests say, not the truth.
+
+    eps_fc       P(held-out tests pass | patch is wrong): wrong patches that slip through ("false correct")
+    eps_fw       P(held-out tests fail | patch is correct): flaky or over-specific tests ("false wrong")
+    abs_catch    share of slipped-through wrong patches that strengthened tests (SWE-ABS) catch
+    human_error  P(a human auditor flips the label)
+
+    Each candidate then carries labels {"orig", "abs", "human", "true"} (True = wrong). With the
+    defaults (no noise) every label equals `wrong` and the records are identical to before.
+    """
     rng = random.Random(seed)
+    orng = random.Random(seed * 7919 + 17)  # separate stream: noise never shifts the features
     models = models or MODELS
     records = []
     for b in range(n_bugs):
@@ -87,5 +99,15 @@ def simulate(n_bugs: int = 300, k: int = 5, seed: int = 0, models: dict | None =
             c["diff_hash"] = f"{b}-{c['_mode']}-{rng.randint(0, 3)}"
         for c in cands:
             del c["_mode"], c["_applied"]
+            true_wrong = bool(c["wrong"])
+            if true_wrong:
+                orig = not (orng.random() < eps_fc)
+                abs_ = orig or orng.random() < abs_catch
+            else:
+                orig = orng.random() < eps_fw
+                abs_ = orig
+            human = true_wrong if orng.random() >= human_error else not true_wrong
+            c["wrong"] = orig
+            c["labels"] = {"orig": orig, "abs": abs_, "human": human, "true": true_wrong}
         records.append({"task_id": f"sim-{b:04d}", "dataset": "simulated", "simulated": True, "candidates": cands})
     return records

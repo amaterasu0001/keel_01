@@ -104,6 +104,8 @@ class Decision:
     reasons: list[str]
     guarantee: str
     n_calibration: int = 0
+    tier: str = "review"                # merge | review | reject (the PR label stays binary)
+    reject_threshold: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

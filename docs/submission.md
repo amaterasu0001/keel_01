@@ -19,8 +19,8 @@ tests aimed at where the candidates disagree. Keel scores each patch with a code
 score: test outcomes, adversarial survival, diff size and locality, static-analysis deltas, agreement
 across samples and across the two models, and token-level uncertainty that only the open-weights model
 exposes. A conformal risk control layer calibrated on held-out bug fixes turns that score into a
-decision. At a risk level you choose, wrong auto-merges stay below the bound. A Learn-then-Test mode
-bounds the share of merged patches that are wrong. Everything else goes to a human with an explanation.
+decision. At a risk level you choose, wrong auto-merges per bug stay below the bound on average (CRC).
+A Learn-then-Test mode bounds the share of merged patches that are wrong, with probability 1 − δ. Everything else goes to a human with an explanation.
 
 We evaluate on SWE-bench Lite and QuixBugs with a visible/hidden test split, over 200 random splits,
 against merging whenever tests pass, model self-confidence, and an uncalibrated score. An interactive

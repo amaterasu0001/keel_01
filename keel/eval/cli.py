@@ -17,9 +17,11 @@ def _log(m: str) -> None:
 
 def cmd_simulate(a: argparse.Namespace) -> int:
     from .simulate import simulate
-    recs = simulate(a.n, k=a.k, seed=a.seed)
+    recs = simulate(a.n, k=a.k, seed=a.seed, eps_fc=a.eps_fc, eps_fw=a.eps_fw, abs_catch=a.abs_catch,
+                    human_error=a.human_error)
     rec_io.save(a.out, recs)
-    _log(f"wrote {len(recs)} SIMULATED bug records to {a.out}")
+    noise = f" (oracle noise: eps_fc={a.eps_fc}, eps_fw={a.eps_fw})" if a.eps_fc or a.eps_fw else ""
+    _log(f"wrote {len(recs)} SIMULATED bug records to {a.out}{noise}")
     return 0
 
 
@@ -47,7 +49,7 @@ def cmd_quixbugs(a: argparse.Namespace) -> int:
 
 def cmd_swebench(a: argparse.Namespace) -> int:
     from . import swebench as sb
-    insts = sb.load_instances(a.n, seed=a.seed)
+    insts = sb.load_instances(a.n, seed=a.seed, dataset=sb.DATASETS[a.dataset])
     cache = Path(a.cache_dir)
     cand = Path(a.candidates)
     if a.stage == "list-runs":
@@ -57,10 +59,11 @@ def cmd_swebench(a: argparse.Namespace) -> int:
         sb.stage_generate(insts, _pipeline(a), cache, cand, log=_log)
     if a.stage in ("harness", "all"):
         extra = ["--cache_level", "none", "--clean", "True"] if a.low_disk else None
-        sb.stage_harness(cand, Path(a.workdir), max_workers=a.workers, extra_args=extra,
+        sb.stage_harness(cand, Path(a.workdir), max_workers=a.workers, dataset=sb.DATASETS[a.dataset], extra_args=extra,
                          only=a.run_ids.split(",") if a.run_ids else None, log=_log)
     if a.stage in ("records", "all"):
-        sb.stage_records(insts, cand, Path(a.workdir), cache, None, Path(a.out), log=_log)
+        sb.stage_records(insts, cand, Path(a.workdir), cache, None, Path(a.out), log=_log,
+                         dataset_label=f"swebench-{a.dataset}")
     return 0
 
 
@@ -72,7 +75,9 @@ def cmd_analyze(a: argparse.Namespace) -> int:
     simulated = any(r.get("simulated") for r in recs)
     datasets = sorted({r["dataset"] for r in recs})
     _log(f"analysing {len(recs)} bugs from {datasets} ({'SIMULATED' if simulated else 'real'})")
-    ev = evaluate(recs, n_splits=a.splits, delta=a.delta, seed=a.seed)
+    feats = _features(a.features, recs)
+    ev = evaluate(recs, n_splits=a.splits, delta=a.delta, seed=a.seed, features=feats, cal_label=a.cal_label,
+                  eval_label=a.eval_label)
     out = {
         "simulated": simulated, "datasets": datasets, "n_bugs": len(recs),
         "n_candidates": sum(len(r["candidates"]) for r in recs),
@@ -101,8 +106,12 @@ def cmd_calibrate(a: argparse.Namespace) -> int:
     cut = int(len(idx) * a.fit_fraction)
     fit = [recs[i] for i in idx[:cut]]
     cal = [recs[i] for i in idx[cut:]]
-    scorer = fit_scorer(fit)
+    from .. import conformal
+    scorer = fit_scorer(fit, _features(a.features, recs))
+    fit_sel = score_and_select(fit, scorer)
     sel = score_and_select(cal, scorer)
+    grid = conformal.order_grid(conformal.grid_from_scores([x["score"] for x in fit_sel]),
+                                [x["score"] for x in fit_sel], [x["wrong"] for x in fit_sel], len(sel), 0.1)
     from ..cli import _model_id
     from ..generators import build_generator
     models = a.models.split(",")
@@ -111,10 +120,122 @@ def cmd_calibrate(a: argparse.Namespace) -> int:
                                       attack=not a.no_attack, triage=bool(a.triage))
     c = Calibration(scorer=scorer, scores=[s["score"] for s in sel], wrong=[s["wrong"] for s in sel],
                     fingerprint=fp, source=",".join(sorted({r["dataset"] for r in recs})),
-                    simulated=any(r.get("simulated") for r in recs), task_ids=[s["task_id"] for s in sel])
+                    simulated=any(r.get("simulated") for r in recs), task_ids=[s["task_id"] for s in sel], grid=grid)
     c.save(a.out)
-    _log(f"calibration with {c.n} bugs written to {a.out}; threshold at α=10%: {c.threshold(0.1):.4f}")
+    _log(f"calibration with {c.n} bugs written to {a.out}; at α=10%: CRC threshold {c.threshold(0.1):.4f}, "
+         f"LTT threshold {c.threshold(0.1, 'ltt'):.4f}")
     return 0
+
+
+def _features(choice: str, recs: list[dict]) -> list[str] | None:
+    """Feature set for the scorer: Keel's own run features, or the external-agent set."""
+    from ..features import FEATURE_NAMES
+    from .signals_ext import EXTERNAL_FEATURES
+    if choice == "keel":
+        return list(FEATURE_NAMES)
+    if choice == "external":
+        return list(EXTERNAL_FEATURES)
+    external = any(r.get("submission") for r in recs)
+    return list(EXTERNAL_FEATURES) if external else None
+
+
+def _load_all(paths: list[str]) -> list[dict]:
+    recs = []
+    for p in paths:
+        recs += rec_io.load(p)
+    return recs
+
+
+def _instances(a: argparse.Namespace) -> dict[str, dict]:
+    from .experiments_repo import load_instances_file
+    if a.instances:
+        return load_instances_file(a.instances)
+    from . import swebench as sb
+    return {r["instance_id"]: r for r in sb.load_instances(None, dataset=sb.DATASETS[a.dataset])}
+
+
+def cmd_submission(a: argparse.Namespace) -> int:
+    """Records from published leaderboard submissions (swe-bench/experiments folders)."""
+    from .experiments_repo import load_submission
+    insts = _instances(a)
+    if a.limit:
+        insts = dict(sorted(insts.items())[:a.limit])
+    judge = None
+    if a.judge:
+        from ..generators import build_generator
+        judge = build_generator(a.judge, cache_dir=a.cache)
+    out_dir = Path(a.out_dir)
+    for folder in a.folders:
+        recs = load_submission(folder, insts, judge=judge, with_traj=not a.no_traj, log=_log)
+        out = out_dir / f"{Path(folder).name}.jsonl"
+        rec_io.save(out, recs)
+        _log(f"wrote {out}")
+    return 0
+
+
+def cmd_abs_labels(a: argparse.Namespace) -> int:
+    from . import abs_labels as ab
+    recs = rec_io.load(a.records)
+    if a.final_results:
+        labels = ab.read_final_results(a.final_results)
+    else:
+        labels = ab.read_harness_reports(a.workdir, a.run_id)
+    key_map = json.loads(Path(a.key_map).read_text()) if a.key_map else None
+    ab.merge(recs, labels, key_map=key_map, monotone=not a.no_monotone, log=_log)
+    rec_io.save(a.out or a.records, recs)
+    _log(f"wrote {a.out or a.records}")
+    return 0
+
+
+def cmd_audit_export(a: argparse.Namespace) -> int:
+    from .audit import export
+    recs = _load_all(a.records)
+    st = export(recs, _instances(a), a.out, a.audit_frac, tuple(a.oracles.split(",")), a.double_frac, a.seed)
+    _log(f"audit: {st['items']} items ({st['double_rated']} for a second rater) in {a.out}. Give raters "
+         f"items/ and sheet.csv only; key.csv links items back to agents and must stay hidden from them.")
+    return 0
+
+
+def cmd_audit_import(a: argparse.Namespace) -> int:
+    from .audit import import_verdicts
+    recs = rec_io.load(a.records)
+    st = import_verdicts(recs, a.audit, unsure_as_wrong=not a.unsure_as_missing)
+    rec_io.save(a.out or a.records, recs)
+    _log(f"audit import: {st}")
+    if st.get("kappa") is not None and st["kappa"] < 0.6:
+        _log("Cohen's kappa is below 0.6: refine the labelling guide and re-rate before using these labels")
+    return 0
+
+
+def cmd_thesis(a: argparse.Namespace) -> int:
+    """RQ1 (inflation), RQ3 (correction) and RQ4 (audit budget) in one run, with tables and charts."""
+    from .figures import write_thesis_outputs
+    from .records import has_oracle
+    from .thesis import audit_budget_curve, evaluate_noisy, inflation
+    recs = _load_all(a.records)
+    feats = _features(a.features, recs)
+    alphas = [float(x) for x in a.alphas.split(",")]
+    eval_label = a.eval_label
+    if eval_label == "auto":
+        eval_label = "true" if has_oracle(recs, "true") else "best"
+    _log(f"{len(recs)} bugs; evaluating against oracle '{eval_label}'")
+    res = {"n_bugs": len(recs), "eval_label": eval_label, "n_splits": a.splits, "alphas": alphas,
+           "simulated": any(r.get("simulated") for r in recs)}
+    oracles = tuple(o for o in ("orig", "abs", "human", "true")
+                    if any(rec_label_any(r, o) for r in recs))
+    res["inflation"] = inflation(recs, alphas, a.splits, a.delta, a.seed, feats, oracles)
+    res["correction"] = evaluate_noisy(recs, alphas, a.splits, a.delta, a.seed, feats, eval_label, a.audit_frac)
+    if a.budgets:
+        res["budget"] = audit_budget_curve(recs, [int(x) for x in a.budgets.split(",")], a.budget_alpha,
+                                           max(20, a.splits // 2), a.delta, a.seed, feats, eval_label, a.audit_frac)
+    for p in write_thesis_outputs(res, a.out_dir):
+        _log(f"wrote {p}")
+    return 0
+
+
+def rec_label_any(record: dict, oracle: str) -> bool:
+    from .records import label as rec_label
+    return any(rec_label(c, oracle) is not None for c in record["candidates"])
 
 
 def _gen_args(p: argparse.ArgumentParser) -> None:
@@ -135,6 +256,11 @@ def add_eval_commands(sub) -> None:
     s.add_argument("--n", type=int, default=300)
     s.add_argument("--k", type=int, default=5)
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--eps-fc", type=float, default=0.0, help="P(held-out tests pass a wrong patch)")
+    s.add_argument("--eps-fw", type=float, default=0.0, help="P(held-out tests fail a correct patch)")
+    s.add_argument("--abs-catch", type=float, default=0.7,
+                   help="share of slipped-through wrong patches that strengthened tests catch")
+    s.add_argument("--human-error", type=float, default=0.0, help="P(a human auditor flips the label)")
     s.set_defaults(fn=cmd_simulate)
 
     q = es.add_parser("quixbugs", help="run Keel on QuixBugs and record hidden-test labels")
@@ -147,8 +273,9 @@ def add_eval_commands(sub) -> None:
     q.add_argument("--rebuild", action="store_true")
     q.set_defaults(fn=cmd_quixbugs)
 
-    w = es.add_parser("swebench", help="SWE-bench Lite: generate / harness / records")
+    w = es.add_parser("swebench", help="SWE-bench Lite/Verified with Keel's generators: generate / harness / records")
     _gen_args(w)
+    w.add_argument("--dataset", choices=["lite", "verified"], default="lite")
     w.add_argument("--stage", choices=["generate", "harness", "records", "all", "list-runs"], default="all")
     w.add_argument("--run-ids", help="harness stage: only these run ids (comma-separated)")
     w.add_argument("--low-disk", action="store_true", help="harness stage: delete images after each instance")
@@ -167,7 +294,63 @@ def add_eval_commands(sub) -> None:
     an.add_argument("--splits", type=int, default=200)
     an.add_argument("--delta", type=float, default=0.1)
     an.add_argument("--seed", type=int, default=0)
+    an.add_argument("--features", choices=["auto", "keel", "external"], default="auto")
+    an.add_argument("--cal-label", default="orig", help="oracle to fit and calibrate on (orig, abs, human, best)")
+    an.add_argument("--eval-label", default="orig", help="oracle to measure realised error with")
     an.set_defaults(fn=cmd_analyze)
+
+    sm = es.add_parser("submission", help="records from published SWE-bench submissions (swe-bench/experiments)")
+    sm.add_argument("folders", nargs="+", help="submission folders, e.g. evaluation/verified/<name>")
+    sm.add_argument("--instances", help="local SWE-bench rows (.json/.jsonl); default: download")
+    sm.add_argument("--dataset", choices=["lite", "verified"], default="verified")
+    sm.add_argument("--out-dir", default="results/agents")
+    sm.add_argument("--limit", type=int, help="only the first N instances (pilot)")
+    sm.add_argument("--judge", help="model for the LLM-judge signal (optional, costs API calls)")
+    sm.add_argument("--cache", default=".keel-cache")
+    sm.add_argument("--no-traj", action="store_true")
+    sm.set_defaults(fn=cmd_submission)
+
+    ab = es.add_parser("abs-labels", help="merge strengthened-test (SWE-ABS) labels into records")
+    ab.add_argument("records")
+    ab.add_argument("--final-results", help="SWE-ABS swe_abs_res/eval_agent/<run>/final_results.json")
+    ab.add_argument("--workdir", help="official-harness workdir (cross-check route)")
+    ab.add_argument("--run-id")
+    ab.add_argument("--key-map", help="JSON {generator: SWE-ABS model key}")
+    ab.add_argument("--no-monotone", action="store_true", help="allow ABS to pass a patch the original tests fail")
+    ab.add_argument("--out", help="default: overwrite the records file")
+    ab.set_defaults(fn=cmd_abs_labels)
+
+    ae = es.add_parser("audit-export", help="write the human-audit items for the audit pool")
+    ae.add_argument("records", nargs="+")
+    ae.add_argument("--instances", help="local SWE-bench rows (.json/.jsonl); default: download")
+    ae.add_argument("--dataset", choices=["lite", "verified"], default="verified")
+    ae.add_argument("--out", default="results/audit")
+    ae.add_argument("--audit-frac", type=float, default=0.25)
+    ae.add_argument("--oracles", default="orig,abs")
+    ae.add_argument("--double-frac", type=float, default=0.3)
+    ae.add_argument("--seed", type=int, default=0)
+    ae.set_defaults(fn=cmd_audit_export)
+
+    ai = es.add_parser("audit-import", help="read human verdicts into records (and report Cohen's kappa)")
+    ai.add_argument("records")
+    ai.add_argument("--audit", default="results/audit")
+    ai.add_argument("--out", help="default: overwrite the records file")
+    ai.add_argument("--unsure-as-missing", action="store_true", help="default treats 'unsure' as wrong")
+    ai.set_defaults(fn=cmd_audit_import)
+
+    th = es.add_parser("thesis", help="RQ1 inflation, RQ3 correction, RQ4 audit budget -> tables and charts")
+    th.add_argument("records", nargs="+")
+    th.add_argument("--out-dir", default="results/thesis")
+    th.add_argument("--alphas", default="0.05,0.1,0.15,0.2,0.3")
+    th.add_argument("--splits", type=int, default=200)
+    th.add_argument("--delta", type=float, default=0.1)
+    th.add_argument("--seed", type=int, default=0)
+    th.add_argument("--features", choices=["auto", "keel", "external"], default="auto")
+    th.add_argument("--eval-label", default="auto", help="auto = 'true' in simulation, else 'best'")
+    th.add_argument("--audit-frac", type=float, default=0.25)
+    th.add_argument("--budgets", default="30,60,100,150,300", help="audit budgets for RQ4 ('' to skip)")
+    th.add_argument("--budget-alpha", type=float, default=0.1)
+    th.set_defaults(fn=cmd_thesis)
 
     c = sub.add_parser("calibrate", help="build a deployment calibration from records")
     c.add_argument("records", nargs="+")
@@ -179,4 +362,5 @@ def add_eval_commands(sub) -> None:
     c.add_argument("--no-attack", action="store_true")
     c.add_argument("--triage")
     c.add_argument("--fingerprint", help="override the computed fingerprint")
+    c.add_argument("--features", choices=["auto", "keel", "external"], default="auto")
     c.set_defaults(fn=cmd_calibrate)

@@ -36,13 +36,19 @@ class Calibration:
     simulated: bool = False
     notes: str = ""
     task_ids: list[str] = field(default_factory=list)
+    # LTT threshold grid, fixed before calibration (from the fit split's scores). None = LTT_GRID.
+    grid: list[float] | None = None
 
     @property
     def n(self) -> int:
         return len(self.scores)
 
     def threshold(self, alpha: float, method: str = "crc", delta: float = 0.1) -> float:
-        return conformal.threshold(method, self.scores, self.wrong, alpha, delta)
+        return conformal.threshold(method, self.scores, self.wrong, alpha, delta, self.grid)
+
+    def tiers(self, alpha: float, beta: float = 0.1, method: str = "ltt", delta: float = 0.1) -> conformal.Tiers:
+        """Merge / review / reject thresholds, calibrated jointly (see conformal.tier_thresholds)."""
+        return conformal.tier_thresholds(self.scores, self.wrong, alpha, beta, delta, self.grid, method)
 
     def to_dict(self) -> dict:
         d = asdict(self)

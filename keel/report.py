@@ -28,6 +28,8 @@ def pr_body(report: RepairReport, summary: str = "") -> str:
     d = report.decision
     sel = report.selected
     lines = [f"## Keel: {BADGE.get(d.label, d.label)}", ""]
+    if getattr(d, "tier", None) == "reject":
+        lines += ["🔴 **Likely wrong.** This patch falls in the calibrated reject tier.", ""]
     if summary:
         lines += [summary, ""]
     lines += ["### Why", *[f"- {r}" for r in d.reasons], ""]
@@ -35,7 +37,8 @@ def pr_body(report: RepairReport, summary: str = "") -> str:
               f"{d.guarantee}" if d.guarantee else "_none_",
               "",
               f"Risk level α = **{d.alpha:.0%}**, method **{d.method.upper()}**, "
-              f"threshold **{d.threshold:.3f}**, this patch's risk score **{d.score:.3f}**.",
+              f"threshold **{d.threshold:.3f}**, this patch's risk score **{d.score:.3f}**"
+              + (f", reject threshold **{d.reject_threshold:.3f}**." if d.reject_threshold is not None else "."),
               "",
               "<sub>Assumes this bug is exchangeable with the calibration bugs (same models, prompts and "
               "kind of repository). The guarantee is over bugs on average, not about this one patch. "

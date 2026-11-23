@@ -55,7 +55,7 @@ def build_pipeline(cfg: KeelConfig, models: list[str], attacker: str | None, tri
     cal = Calibration.load(calibration) if calibration else None
     return Pipeline(gens, attacker=_gen(attacker, cache), triage=_gen(triage, cache),
                     explainer=_gen(explainer, cache), calibration=cal, alpha=cfg.alpha,
-                    method=cfg.method, delta=cfg.delta, fingerprint=fp, allow_stale=allow_stale, log=log)
+                    method=cfg.method, delta=cfg.delta, beta=cfg.beta, fingerprint=fp, allow_stale=allow_stale, log=log)
 
 
 def cmd_repair(a: argparse.Namespace) -> int:

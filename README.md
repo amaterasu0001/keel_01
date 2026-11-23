@@ -24,9 +24,9 @@ Keel uses **Meta's Muse models** to generate candidate patches for failing tests
 2. Keel scores each patch with a **code-aware nonconformity score**: test outcomes, adversarial survival,
    diff size and locality, static-analysis deltas, self-consistency across samples and across models,
    and token-level uncertainty from the open-weights model.
-3. A **conformal risk control** layer, calibrated on held-out bug fixes, turns the score into a decision
-   with a distribution-free guarantee: at a risk level you choose (say 10%), wrong auto-merges stay
-   below that bound.
+3. A **distribution-free calibration** layer (Learn-then-Test or conformal risk control), calibrated on
+   held-out bug fixes, turns the score into a decision with a guarantee at a risk level you choose
+   (say 10%). With LTT: with probability ≥ 1 − δ, at most 10% of auto-merged patches are wrong.
 4. Keel opens a pull request labelled **AUTO-MERGE** or **NEEDS REVIEW**, with an explanation.
 
 > Built for the Meta Global AI Developer Hackathon 2026 (*Push the Frontier*, software). All code in
@@ -56,18 +56,29 @@ Every model goes through one OpenAI-compatible client, so changing provider is a
 Calibration data: *n* held-out bugs, each with the risk score *sᵢ* of Keel's selected patch and a label
 *wrongᵢ* from **hidden tests the agent never saw**. Keel auto-merges when *s ≤ λ̂*.
 
-* **CRC (default):** λ̂ = max{λ : (Σᵢ wrongᵢ·1[sᵢ ≤ λ] + 1)/(n + 1) ≤ α}. Then
-  **E[1{auto-merged and wrong}] ≤ α**: on average, at most α of bugs get a wrong patch auto-merged
-  (Angelopoulos et al., *Conformal Risk Control*, 2022).
-* **LTT:** each threshold on a fixed grid is tested with an exact binomial test (Bonferroni). Then
-  **with probability ≥ 1 − δ, at most α of auto-merged patches are wrong**
-  (Angelopoulos et al., *Learn then Test*, 2021).
+* **CRC (product default):** λ̂ = max{λ : (Σᵢ wrongᵢ·1[sᵢ ≤ λ] + 1)/(n + 1) ≤ α}. Then
+  **E[1{auto-merged and wrong}] ≤ α**: on average, at most α of *all bugs* get a wrong patch
+  auto-merged (Angelopoulos et al., *Conformal Risk Control*, 2022). This is a bound per bug, not
+  per merge: when few patches are merged, the share of merged patches that are wrong can exceed α.
+* **LTT (the thesis method):** each threshold on a grid fixed before calibration (from the scorer's
+  fit split) is tested with an exact binomial test, and the family-wise error is controlled with
+  **fixed-sequence testing** (most conservative threshold first, stop at the first failure). Then
+  **with probability ≥ 1 − δ, at most α of auto-merged patches are wrong** (the false-merge rate;
+  Angelopoulos et al., *Learn then Test*, 2021). Bonferroni is kept as `ltt_bonferroni` for comparison;
+  it needs about twice as many calibration bugs (49 instead of 22 error-free merges at α = δ = 10%).
+* **Three tiers:** merge / review / reject. The reject threshold is certified jointly (δ split in half):
+  at most β (`beta` in `.keel.toml`, default 10%) of the patches Keel marks *likely wrong* are actually
+  correct. The pull-request label stays AUTO-MERGE / NEEDS REVIEW; likely-wrong patches say so in the PR.
+
+"Wrong" means failing the held-out tests. Tests can miss wrong patches, so these guarantees are only
+as good as the tests. `keel/conformal_noisy.py` implements a noise-corrected LTT that also bounds the
+*true* false-merge rate using a small human audit (see [the thesis workflow](docs/thesis-gap1.md)).
 
 Assumptions are stated in every PR. Calibration and deployment bugs must be exchangeable, so Keel
 fingerprints its models, prompts and scorer and refuses to auto-merge on a stale calibration. With no
 calibration at all, Keel never auto-merges.
 
-`tests/test_conformal.py` checks both guarantees by simulation on every CI run.
+`tests/test_conformal.py` and `tests/test_thesis.py` check the guarantees by simulation on every CI run.
 
 ## The Keel platform
 
@@ -109,6 +120,18 @@ keel eval quixbugs  --models muse-spark,muse-spark-open --k 5    # 40 programs, 
 keel eval swebench  --n 100 --stage all                          # SWE-bench Lite, official harness
 keel eval analyze   results/quixbugs/records.jsonl --out web/public/data/results.json
 keel calibrate      results/quixbugs/records.jsonl --out calibration.json
+```
+
+Thesis experiments (certified acceptance under imperfect test oracles) use published agent patches,
+strengthened tests and a human audit; the full step-by-step workflow is in
+[`docs/thesis-gap1.md`](docs/thesis-gap1.md):
+
+```bash
+keel eval submission  experiments/evaluation/verified/<submission> --out-dir results/agents
+keel eval abs-labels  results/agents/<submission>.jsonl --final-results <SWE-ABS final_results.json>
+keel eval audit-export results/agents/<submission>.jsonl --out results/audit
+keel eval audit-import results/agents/<submission>.jsonl --audit results/audit
+keel eval thesis      results/agents/<submission>.jsonl --out-dir results/thesis
 ```
 
 Both benchmarks also run from the Actions tab (`Benchmark – QuixBugs`, `Benchmark – SWE-bench Lite`).

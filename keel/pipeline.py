@@ -32,7 +32,7 @@ class Pipeline:
     def __init__(self, generators: list[GeneratorSpec], attacker: Generator | None = None,
                  triage: Generator | None = None, explainer: Generator | None = None,
                  scorer: Scorer | None = None, calibration: Calibration | None = None,
-                 alpha: float = 0.1, method: str = "crc", delta: float = 0.1,
+                 alpha: float = 0.1, method: str = "crc", delta: float = 0.1, beta: float = 0.1,
                  fingerprint: str = "", allow_stale: bool = False, seed: int = 0,
                  log: Callable[[str], None] = print):
         self.generators = generators
@@ -41,7 +41,7 @@ class Pipeline:
         self.explainer = explainer
         self.calibration = calibration
         self.scorer = scorer or (calibration.scorer if calibration else Scorer())
-        self.alpha, self.method, self.delta = alpha, method, delta
+        self.alpha, self.method, self.delta, self.beta = alpha, method, delta, beta
         self.fingerprint = fingerprint
         self.allow_stale = allow_stale
         self.seed = seed
@@ -187,31 +187,39 @@ class Pipeline:
     def decide(self, selected: CandidateEvaluation | None) -> Decision:
         cal = self.calibration
         notes: list[str] = []
+        tiers = conformal.Tiers(merge=conformal.NEVER, reject=conformal.NO_REJECT)
         if cal is None:
-            thr = conformal.NEVER
             notes.append("Keel has no calibration data, so it never auto-merges")
         elif cal.fingerprint and self.fingerprint and cal.fingerprint != self.fingerprint and not self.allow_stale:
-            thr = conformal.NEVER
             notes.append("calibration was made with different models/prompts; recalibrate before auto-merging")
         else:
-            thr = cal.threshold(self.alpha, self.method, self.delta)
-            if thr == conformal.NEVER:
+            tiers = cal.tiers(self.alpha, self.beta, self.method, self.delta)
+            if tiers.merge == conformal.NEVER:
                 notes.append(f"with {cal.n} calibration bugs no threshold certifies α={self.alpha:.0%}")
+        thr = tiers.merge
         score = selected.score if selected else 1.0
-        label = AUTO_MERGE if selected and not selected.gate_failures and score <= thr else NEEDS_REVIEW
+        gated = bool(selected.gate_failures) if selected else True
+        tier = tiers.tier(score, gated) if selected else conformal.REVIEW
+        label = AUTO_MERGE if tier == conformal.MERGE else NEEDS_REVIEW
         rs = explain.reasons(selected)
-        if label == NEEDS_REVIEW and selected and not selected.gate_failures and thr > conformal.NEVER:
+        if tier == conformal.REJECT:
+            rs.insert(0, f"Likely wrong: risk score {score:.3f} is in the reject tier "
+                         f"(≥ {min(tiers.reject, 1.0):.3f}); consider closing this pull request")
+        elif label == NEEDS_REVIEW and selected and not selected.gate_failures and thr > conformal.NEVER:
             rs.insert(0, f"Risk score {score:.3f} is above the calibrated threshold {thr:.3f}")
         elif label == AUTO_MERGE:
             rs.insert(0, f"Risk score {score:.3f} is within the calibrated threshold {thr:.3f}")
         rs = notes + rs
         n = cal.n if cal else 0
         guarantee = conformal.guarantee_text(self.method, self.alpha, self.delta, n)
+        if tiers.reject != conformal.NO_REJECT:
+            guarantee += (f" Jointly, at most {self.beta:.0%} of patches marked likely-wrong are actually correct.")
         if cal is not None and cal.simulated:
             guarantee += " (DEMO: calibrated on simulated data, not a real guarantee)"
         return Decision(label=label, alpha=self.alpha, method=self.method, threshold=thr, score=score,
                         candidate_id=selected.candidate.candidate_id if selected else None,
-                        reasons=rs, guarantee=guarantee, n_calibration=n)
+                        reasons=rs, guarantee=guarantee, n_calibration=n, tier=tier,
+                        reject_threshold=None if tiers.reject == conformal.NO_REJECT else tiers.reject)
 
     def summary(self, decision: Decision) -> str:
         """Plain-English explanation, written by the explainer model if one is configured."""
