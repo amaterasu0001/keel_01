@@ -1,0 +1,7 @@
+# Build context is the repository root; send only what the image copies (BuildKit reads this file
+# because it sits next to docker/oracle2/Dockerfile).
+*
+!pyproject.toml
+!README.md
+!keel/
+keel/**/__pycache__

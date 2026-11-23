@@ -12,6 +12,7 @@ three labels per patch, runs the experiments for RQ1, RQ3 and RQ4, and writes ev
 | Records from leaderboard submissions | `keel/eval/experiments_repo.py` |
 | Signals for external agents (diff, issue, trajectory, LLM judge) | `keel/eval/signals_ext.py` |
 | Strengthened-test labels: run SWE-ABS, read its output (Oracle 2) | `keel/eval/abs_labels.py` |
+| Oracle 2 in Docker: image, preflight checks, `docker run` | `docker/oracle2/Dockerfile`, `keel/eval/abs_docker.py` |
 | Human audit: two blind sheets, status, adjudication, import, kappa (Oracle 3) | `keel/eval/audit.py` |
 | Experiments: inflation, correction, audit budget | `keel/eval/thesis.py` |
 | Tables and SVG charts | `keel/eval/figures.py` |
@@ -61,28 +62,49 @@ Add `--judge muse-spark` to `submission` for the LLM-judge signal (one call per 
 The fallback, if you already have a folder from the experiments repository's own
 `python -m analysis.download_logs`: point `submission` at it; `--preds <file>` if predictions sit elsewhere.
 
-## Step 2 · Oracle 2: strengthened-test labels (Linux x86 + Docker)
+## Step 2 · Oracle 2: strengthened-test labels (Docker)
 
 The `fetch` output folder is exactly what the SWE-ABS harness reads
-(`<root>/<submission>/logs/<instance>/{report.json,patch.diff}`). On the Linux machine:
+(`<root>/<submission>/logs/<instance>/{report.json,patch.diff}`). Two ways to run the harness.
+
+### Route A (recommended): the keel-oracle2 image
+
+Needs only Docker with an x86-64 Linux engine: a Linux machine, or Docker Desktop (WSL 2 backend) on
+Windows or an Intel Mac, with about 16 GB memory and 120+ GB disk for Docker (Docker Desktop:
+Settings → Resources). No SWE-ABS or conda install on the host.
+
+```bash
+keel eval docker-check                              # engine running? Linux, x86-64, memory, disk, image
+keel eval abs-docker-build                          # builds keel-oracle2 (SWE-ABS pinned + Keel), once
+keel eval abs-run --docker --models-root data/submissions --models 20250807_openhands_gpt5 \
+    --run-id pilot --pilot 20                       # 20 instances first
+keel eval abs-run --docker --models-root data/submissions --models 20250807_openhands_gpt5,<other> \
+    --run-id full
+keel eval abs-labels results/agents/20250807_openhands_gpt5.jsonl --results-dir results/sweabs --run-id full
+```
+
+The harness container gets the host's Docker socket and starts the SWE-bench instance containers next
+to itself on the host; patches and tests go into them through the Docker API, so only the submissions
+folder (read-only), `results/sweabs` and a Hugging Face cache volume are mounted. Output:
+`results/sweabs/eval_agent/<run_id>/final_results.json`. On Linux the files are handed back to your
+user. `--dry-run` prints the `docker run` command without starting anything. The image pins SWE-ABS to
+commit 26b4c73 (2026-10-26); `abs-docker-build --sweabs-ref <sha>` builds another.
+
+### Route B: SWE-ABS installed on a Linux machine
 
 ```bash
 git clone https://github.com/OpenAgentEval/SWE-ABS && cd SWE-ABS
 conda create -n swe-abs python=3.11 -y && conda activate swe-abs && bash setup.sh
-pip install -e /path/to/keel_01                                     # Keel in the same environment
-cd /path/to/keel_01
+pip install -e /path/to/keel_01
 keel eval abs-run --models-root data/submissions --models 20250807_openhands_gpt5 \
-    --run-id pilot --pilot 20 --sweabs-dir ~/SWE-ABS                # 20 instances first
-keel eval abs-run --models-root data/submissions --models 20250807_openhands_gpt5,<other> \
-    --run-id full --sweabs-dir ~/SWE-ABS                            # then everything
+    --run-id full --sweabs-dir ~/SWE-ABS
 keel eval abs-labels results/agents/20250807_openhands_gpt5.jsonl --sweabs-dir ~/SWE-ABS --run-id full
 ```
 
-Without `--sweabs-dir`, `abs-run` only prints the command (run it yourself from `SWE-ABS/swe-bench`).
-SWE-ABS evaluates only instances the original run resolved; the others go to its `init_fail` and stay
-wrong in Keel. `abs-labels` reports `flipped_to_wrong` (silent failures caught by the stronger tests),
-`abs_pass_but_orig_fail` (should be about 0: an environment check), `missing`, and SWE-ABS errors.
-If generator names differ from the SWE-ABS model keys, pass `--key-map map.json`.
+Either way: SWE-ABS evaluates only instances the original run resolved; the others go to its
+`init_fail` and stay wrong in Keel. `abs-labels` reports `flipped_to_wrong` (silent failures caught by
+the stronger tests), `abs_pass_but_orig_fail` (should be about 0: an environment check), `missing`,
+and SWE-ABS errors. If generator names differ from the SWE-ABS model keys, pass `--key-map map.json`.
 
 ## Step 3 · Oracle 3: human audit
 
@@ -124,6 +146,6 @@ of oracles. RQ2 (which signals separate silent failures) uses the same records; 
 
 ## What is not automated
 
-* Docker itself: `abs-run` drives the SWE-ABS harness but needs a Linux x86 machine with Docker.
+* A Docker engine: `abs-run --docker` needs Docker with an x86-64 Linux engine and enough disk.
 * The human verdicts.
 * Variant C (prediction-powered inference, Einbinder et al., TPAMI 2025) is not implemented.

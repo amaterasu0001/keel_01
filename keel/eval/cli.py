@@ -216,6 +216,8 @@ def cmd_abs_run(a: argparse.Namespace) -> int:
     if a.pilot:
         ids = ab.ready_instances(Path(a.models_root) / models[0])[:a.pilot]
         _log(f"pilot: {len(ids)} downloaded instances resolved by {models[0]}")
+    if a.docker:
+        return _abs_run_docker(a, models, ids)
     cmd = ab.abs_command(a.models_root, models, a.run_id, ids, a.workers, a.timeout, a.python, rerun=a.rerun)
     print(" ".join(cmd))
     if a.dry_run or not a.sweabs_dir:
@@ -227,9 +229,66 @@ def cmd_abs_run(a: argparse.Namespace) -> int:
     return rc
 
 
+def _abs_run_docker(a: argparse.Namespace, models: list[str], ids: list[str] | None) -> int:
+    from . import abs_docker as dk
+    cmd = dk.run_command(a.models_root, models, a.run_id, a.results_dir, ids, a.workers, a.timeout, a.image,
+                         a.rerun, host_uid_gid=dk.host_ids(), name=f"keel-oracle2-{a.run_id}")
+    print(" ".join(cmd))
+    if a.dry_run:
+        _log("dry run: nothing started")
+        return 0
+    pf = dk.preflight(a.image, a.results_dir, allow_arm=a.allow_arm)
+    _log(f"docker: {pf.info}")
+    for w in pf.warnings:
+        _log(f"warning: {w}")
+    if not pf.ok:
+        for p in pf.problems:
+            _log(f"problem: {p}")
+        return 2
+    (Path(a.results_dir) / "logs").mkdir(parents=True, exist_ok=True)
+    rc = dk.execute(cmd, log=_log)
+    out = dk.final_results_path(a.results_dir, a.run_id)
+    _log(f"harness exit code {rc}; results: {out}" + ("" if out.exists() else " (missing!)"))
+    if out.exists():
+        _log(f"next: keel eval abs-labels <records> --results-dir {a.results_dir} --run-id {a.run_id}")
+    return rc
+
+
+def cmd_abs_docker_build(a: argparse.Namespace) -> int:
+    from . import abs_docker as dk
+    cmd = dk.build_command(a.tag, a.sweabs_ref, a.lfs, no_cache=a.no_cache)
+    print(" ".join(cmd))
+    if a.dry_run:
+        return 0
+    pf = dk.preflight(a.tag, allow_arm=a.allow_arm)
+    blocking = [p for p in pf.problems if "not found; build it" not in p]  # a missing image is why we build
+    if blocking:
+        for p in blocking:
+            _log(f"problem: {p}")
+        return 2
+    return dk.execute(cmd, log=_log)
+
+
+def cmd_docker_check(a: argparse.Namespace) -> int:
+    from . import abs_docker as dk
+    pf = dk.preflight(a.image, a.results_dir, allow_arm=a.allow_arm)
+    _log(f"docker: {pf.info}")
+    for w in pf.warnings:
+        _log(f"warning: {w}")
+    for p in pf.problems:
+        _log(f"problem: {p}")
+    _log("ready for Oracle 2" if pf.ok else "not ready for Oracle 2")
+    return 0 if pf.ok else 2
+
+
 def cmd_abs_labels(a: argparse.Namespace) -> int:
     from . import abs_labels as ab
     recs = rec_io.load(a.records)
+    if a.results_dir and not a.final_results:
+        from .abs_docker import final_results_path
+        if not a.run_id:
+            raise SystemExit("--results-dir needs --run-id")
+        a.final_results = str(final_results_path(a.results_dir, a.run_id))
     if a.sweabs_dir and not a.final_results:
         if not a.run_id:
             raise SystemExit("--sweabs-dir needs --run-id")
@@ -419,11 +478,32 @@ def add_eval_commands(sub) -> None:
     ar.add_argument("--python", default="python", help="python of the swe-abs environment")
     ar.add_argument("--rerun", action="store_true", help="ignore an existing final_results.json for this run id")
     ar.add_argument("--dry-run", action="store_true")
+    ar.add_argument("--docker", action="store_true",
+                    help="run the harness in the keel-oracle2 image (no SWE-ABS install needed)")
+    ar.add_argument("--image", default="keel-oracle2", help="with --docker: image tag")
+    ar.add_argument("--results-dir", default="results/sweabs", help="with --docker: where final_results.json goes")
+    ar.add_argument("--allow-arm", action="store_true", help="with --docker: try on an ARM engine anyway")
     ar.set_defaults(fn=cmd_abs_run)
+
+    adb = es.add_parser("abs-docker-build", help="Oracle 2: build the keel-oracle2 image (SWE-ABS + Keel)")
+    adb.add_argument("--tag", default="keel-oracle2")
+    adb.add_argument("--sweabs-ref", help="SWE-ABS commit to install (default: the pinned one in the Dockerfile)")
+    adb.add_argument("--lfs", action="store_true", help="also fetch SWE-ABS's Git LFS files")
+    adb.add_argument("--no-cache", action="store_true")
+    adb.add_argument("--allow-arm", action="store_true")
+    adb.add_argument("--dry-run", action="store_true")
+    adb.set_defaults(fn=cmd_abs_docker_build)
+
+    dc = es.add_parser("docker-check", help="Oracle 2: is Docker ready (Linux engine, x86-64, resources, image)?")
+    dc.add_argument("--image", default="keel-oracle2")
+    dc.add_argument("--results-dir", default="results/sweabs")
+    dc.add_argument("--allow-arm", action="store_true")
+    dc.set_defaults(fn=cmd_docker_check)
 
     ab = es.add_parser("abs-labels", help="merge strengthened-test (SWE-ABS) labels into records")
     ab.add_argument("records")
     ab.add_argument("--sweabs-dir", help="find final_results.json for --run-id in this SWE-ABS checkout")
+    ab.add_argument("--results-dir", help="find final_results.json for --run-id here (abs-run --docker output)")
     ab.add_argument("--final-results", help="SWE-ABS swe_abs_res/eval_agent/<run>/final_results.json")
     ab.add_argument("--workdir", help="official-harness workdir (cross-check route)")
     ab.add_argument("--run-id")

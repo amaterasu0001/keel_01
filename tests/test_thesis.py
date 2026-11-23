@@ -432,3 +432,82 @@ def test_openhands_tool_call_trajectory():
                 "name": "str_replace_editor", "arguments": '{"command": "str_replace", "path": "/w/pkg/core.py"}'}}]}]
     f = sx.trajectory_features(traj)
     assert f["traj_test_runs"] == 1.0 and f["traj_edit_steps"] == 1.0 and f["traj_log_files_viewed"] > 0
+
+
+# --- Oracle 2 in Docker --------------------------------------------------------------------------
+
+def test_docker_run_command_mounts_and_harness(tmp_path):
+    from keel.eval import abs_docker as dk
+    cmd = dk.run_command(tmp_path / "subs", ["m1", "m2"], "run1", tmp_path / "res", ["a", "b"], workers=4,
+                         timeout=600, host_uid_gid=None, name="keel-oracle2-run1")
+    j = " ".join(cmd)
+    assert cmd[:4] == ["docker", "run", "--rm", "--init"] and "/var/run/docker.sock:/var/run/docker.sock" in cmd
+    assert f"target={dk.CONTAINER_MODELS},readonly" in j and f"target={dk.CONTAINER_RESULTS}" in j
+    assert f"target={dk.CONTAINER_LOGS}" in j and f"source={dk.HF_VOLUME}" in j
+    i = cmd.index(dk.IMAGE)
+    harness = cmd[i + 1:]
+    assert harness[:3] == ["python", "-m", "swebench.runtest.run_evaluation_test"]
+    assert harness[harness.index("--vaild_model_path") + 1] == dk.CONTAINER_MODELS
+    assert harness[harness.index("--vaild_model_name") + 1] == "m1,m2"
+    assert harness[harness.index("--instance_ids") + 1] == "a,b"
+    # on POSIX hosts the output is chowned back to the host user
+    posix = dk.run_command(tmp_path / "subs", ["m1"], "r", tmp_path / "res", host_uid_gid=(1000, 1000))
+    assert posix[-3:-1] == ["sh", "-c"] and "chown -R 1000:1000" in posix[-1] and "exit $rc" in posix[-1]
+    assert dk.final_results_path(tmp_path / "res", "run1") == tmp_path / "res" / "eval_agent" / "run1" / \
+        "final_results.json"
+
+
+def test_docker_build_command_uses_repo_dockerfile():
+    from keel.eval import abs_docker as dk
+    root = dk.repo_root()
+    assert root is not None and (root / "docker" / "oracle2" / "Dockerfile").exists()
+    cmd = dk.build_command("img", sweabs_ref="abc123", lfs=True)
+    assert cmd[:2] == ["docker", "build"] and cmd[cmd.index("-t") + 1] == "img"
+    assert "SWEABS_REF=abc123" in cmd and "SWEABS_LFS=1" in cmd and cmd[-1] == str(root)
+
+
+def test_docker_preflight_decisions(tmp_path):
+    import subprocess
+
+    from keel.eval import abs_docker as dk
+
+    def fake(info: dict | None, image_ok=True):
+        def run(cmd, timeout=60):
+            if cmd[:2] == ["docker", "info"]:
+                if info is None:
+                    return subprocess.CompletedProcess(cmd, 1, "", "Cannot connect to the Docker daemon")
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(info), "")
+            return subprocess.CompletedProcess(cmd, 0 if image_ok else 1, "sha256:x", "")
+        return run
+
+    good = {"OSType": "linux", "Architecture": "x86_64", "NCPU": 8, "MemTotal": 32e9}
+    assert dk.preflight(runner=fake(good)).ok
+    down = dk.preflight(runner=fake(None))
+    assert not down.ok and "not running" in down.problems[0] and "Cannot connect" in down.problems[0]
+    arm = dk.preflight(runner=fake({**good, "Architecture": "aarch64"}))
+    assert not arm.ok and dk.preflight(runner=fake({**good, "Architecture": "aarch64"}), allow_arm=True).ok
+    win = dk.preflight(runner=fake({**good, "OSType": "windows"}))
+    assert not win.ok and "Linux containers" in win.problems[0]
+    small = dk.preflight(runner=fake({**good, "NCPU": 2, "MemTotal": 8e9}))
+    assert small.ok and len(small.warnings) == 2
+    noimg = dk.preflight(runner=fake(good, image_ok=False))
+    assert not noimg.ok and "abs-docker-build" in noimg.problems[0]
+
+
+def test_abs_run_docker_dry_run_cli(tmp_path, capsys):
+    import argparse
+
+    from keel.eval.cli import add_eval_commands
+    m = tmp_path / "subs" / "m1"
+    (m / "results").mkdir(parents=True)
+    (m / "results" / "results.json").write_text(json.dumps({"resolved": ["i1"]}))
+    (m / "logs" / "i1").mkdir(parents=True)
+    (m / "logs" / "i1" / "report.json").write_text("{}")
+    (m / "logs" / "i1" / "patch.diff").write_text(DIFF)
+    p = argparse.ArgumentParser()
+    add_eval_commands(p.add_subparsers(dest="cmd"))
+    a = p.parse_args(["eval", "abs-run", "--models-root", str(tmp_path / "subs"), "--models", "m1", "--run-id", "r",
+                      "--pilot", "5", "--docker", "--results-dir", str(tmp_path / "res"), "--dry-run"])
+    assert a.fn(a) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("docker run") and "--instance_ids i1" in out and "keel-oracle2" in out

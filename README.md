@@ -130,8 +130,9 @@ strengthened tests and a human audit; the full step-by-step workflow is in
 keel eval instances    --out results/verified.jsonl
 keel eval fetch        <submission> --instances results/verified.jsonl --out data/submissions   # Oracle 1 input
 keel eval submission   data/submissions/<submission> --instances results/verified.jsonl --out-dir results/agents
-keel eval abs-run      --models <submission> --run-id full --sweabs-dir ~/SWE-ABS              # Oracle 2 (Linux + Docker)
-keel eval abs-labels   results/agents/<submission>.jsonl --sweabs-dir ~/SWE-ABS --run-id full
+keel eval abs-docker-build                                                                     # Oracle 2 image, once
+keel eval abs-run      --docker --models <submission> --run-id full                              # Oracle 2 (Docker)
+keel eval abs-labels   results/agents/<submission>.jsonl --results-dir results/sweabs --run-id full
 keel eval audit-export results/agents/<submission>.jsonl --instances results/verified.jsonl --out results/audit
 keel eval audit-status --audit results/audit                                                     # Oracle 3
 keel eval audit-import results/agents/<submission>.jsonl --audit results/audit
